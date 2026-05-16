@@ -15,7 +15,7 @@ from discord import app_commands
 import psycopg
 from psycopg.rows import dict_row
 
-APP_VERSION = "Alaris_TournamentBot_v006"
+APP_VERSION = "Alaris_TournamentBot_v007"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] TourneyBot: %(message)s")
 LOG = logging.getLogger("TourneyBot")
@@ -696,8 +696,8 @@ async def char_auto(interaction: discord.Interaction, current: str):
 
 
 async def owned_char_auto(interaction: discord.Interaction, current: str):
-    owner = None if await is_staff(interaction) else int(interaction.user.id)
-    return await run_db(search_chars, int(interaction.guild_id or GUILD_ID), current or "", owner)
+    # v007: registration-related character choices are owner-only for everyone, including staff.
+    return await run_db(search_chars, int(interaction.guild_id or GUILD_ID), current or "", int(interaction.user.id))
 
 
 async def tourney_auto(interaction: discord.Interaction, current: str):
@@ -772,7 +772,13 @@ def create_tournament(guild_id: int, name: str, kingdom: str, notes: Optional[st
     return row
 
 
-def add_event(guild_id: int, tournament: str, name: str, etype: str, max_entrants: Optional[int], channel_id: Optional[int]) -> dict[str, Any]:
+def add_event(guild_id: int, tournament: str, name: str, etype: str, max_entrants: Optional[int], channel_id: Optional[int] = None) -> dict[str, Any]:
+    """Create/update an event definition only.
+
+    v007 deliberately does NOT auto-link the event to the command channel.
+    Staff must run /post-event inside the desired discussion/forum post to
+    create and link the live bracket/standings board.
+    """
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament))
@@ -780,19 +786,29 @@ def add_event(guild_id: int, tournament: str, name: str, etype: str, max_entrant
             if not t:
                 return {"ok": False, "reason": "tournament_not_found"}
             cur.execute("""
-                INSERT INTO tourney.events (guild_id,tournament_id,name,event_type,status,max_entrants,format_type,public_channel_id)
-                VALUES (%s,%s,%s,%s,'draft',%s,%s,%s)
+                INSERT INTO tourney.events (guild_id,tournament_id,name,event_type,status,max_entrants,format_type)
+                VALUES (%s,%s,%s,%s,'draft',%s,%s)
                 ON CONFLICT (guild_id,tournament_id,name)
                 DO UPDATE SET event_type=EXCLUDED.event_type,
                               max_entrants=EXCLUDED.max_entrants,
                               format_type=EXCLUDED.format_type,
-                              public_channel_id=EXCLUDED.public_channel_id,
                               updated_at=NOW()
                 RETURNING *;
-            """, (guild_id, t["id"], name.strip(), etype, max_entrants, "solo_match" if etype in SOLO_EVENTS else "open_round", channel_id))
+            """, (guild_id, t["id"], name.strip(), etype, max_entrants, "solo_match" if etype in SOLO_EVENTS else "open_round"))
             e = dict(cur.fetchone())
         conn.commit()
     return {"ok": True, "tournament": dict(t), "event": e}
+
+
+def link_event_board_message(guild_id: int, event_id: int, channel_id: int, message_id: int) -> None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE tourney.events
+                   SET public_channel_id=%s, public_message_id=%s, bracket_message_id=%s, updated_at=NOW()
+                 WHERE guild_id=%s AND id=%s;
+            """, (int(channel_id), int(message_id), int(message_id), int(guild_id), int(event_id)))
+        conn.commit()
 
 
 def set_event_board_message(guild_id: int, event_id: int, message_id: int) -> None:
@@ -872,8 +888,12 @@ def register(guild_id: int, tournament: str, event: str, character: str, actor: 
     c = character_by_name(guild_id, character)
     if not c:
         return {"ok": False, "reason": "character_not_found"}
-    if not staff and c.user_id != actor:
+
+    # v007: tournament registration is owner-only for everyone, including staff.
+    # Staff reward/admin tools should not become a way to register other players' characters.
+    if int(c.user_id) != int(actor):
         return {"ok": False, "reason": "not_owner"}
+
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament))
@@ -886,18 +906,34 @@ def register(guild_id: int, tournament: str, event: str, character: str, actor: 
                 return {"ok": False, "reason": "event_not_found"}
             if e["status"] != "draft":
                 return {"ok": False, "reason": "registration_closed"}
+
+            cur.execute("""
+                SELECT registration_status
+                  FROM tourney.entries
+                 WHERE guild_id=%s AND event_id=%s AND character_id=%s
+                 LIMIT 1;
+            """, (guild_id, e["id"], c.character_id))
+            existing = cur.fetchone()
+            if existing and existing.get("registration_status") != "withdrawn":
+                return {"ok": False, "reason": "already_registered"}
+
             cur.execute("SELECT COUNT(*) AS n FROM tourney.entries WHERE guild_id=%s AND event_id=%s AND registration_status='registered';", (guild_id, e["id"]))
             if e.get("max_entrants") and int(cur.fetchone()["n"] or 0) >= int(e["max_entrants"]):
                 return {"ok": False, "reason": "event_full"}
+
             cur.execute("""
                 INSERT INTO tourney.entries (guild_id,tournament_id,event_id,character_id,user_id,registration_status)
                 VALUES (%s,%s,%s,%s,%s,'registered')
-                ON CONFLICT (guild_id,event_id,character_id) DO UPDATE SET registration_status='registered', updated_at=NOW();
+                ON CONFLICT (guild_id,event_id,character_id)
+                DO UPDATE SET registration_status='registered', updated_at=NOW()
+                WHERE tourney.entries.registration_status='withdrawn';
             """, (guild_id, t["id"], e["id"], c.character_id, c.user_id))
+
             cur.execute("""
                 INSERT INTO tourney.competitor_profiles (guild_id,character_id,events_entered)
                 VALUES (%s,%s,1)
-                ON CONFLICT (guild_id,character_id) DO UPDATE SET events_entered=tourney.competitor_profiles.events_entered+1, updated_at=NOW();
+                ON CONFLICT (guild_id,character_id)
+                DO UPDATE SET events_entered=tourney.competitor_profiles.events_entered+1, updated_at=NOW();
             """, (guild_id, c.character_id))
         conn.commit()
     return {"ok": True, "character": c}
@@ -1184,31 +1220,46 @@ def finalize_tournament_db(guild_id: int, tournament: str, actor: int) -> dict[s
 
 
 async def update_event_board(guild_id: int, tournament: str, event: str) -> Optional[discord.Message]:
+    """Edit an existing /post-event board only.
+
+    v007 intentionally does not create/link an event post from registration or
+    round commands. Staff must run /post-event in the desired discussion/forum
+    post first.
+    """
     ctx = await run_db(event_context, guild_id, tournament, event)
     if not ctx:
         return None
     e = ctx["event"]
-    emb = event_board_embed(ctx)
     channel_id = e.get("public_channel_id")
     msg_id = e.get("public_message_id") or e.get("bracket_message_id")
-    if channel_id and msg_id:
-        ch = client.get_channel(int(channel_id))
-        if ch is None:
-            try:
-                ch = await client.fetch_channel(int(channel_id))
-            except Exception:
-                ch = None
-        if isinstance(ch, (discord.TextChannel, discord.Thread)):
-            try:
-                msg = await ch.fetch_message(int(msg_id))
-                await msg.edit(embed=emb, allowed_mentions=discord.AllowedMentions.none())
-                return msg
-            except Exception:
-                pass
-    sent = await event_post(e, emb)
-    if sent:
-        await run_db(set_event_board_message, guild_id, int(e["id"]), int(sent.id))
-    return sent
+    if not (channel_id and msg_id):
+        return None
+    ch = client.get_channel(int(channel_id))
+    if ch is None:
+        try:
+            ch = await client.fetch_channel(int(channel_id))
+        except Exception:
+            return None
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return None
+    try:
+        msg = await ch.fetch_message(int(msg_id))
+        await msg.edit(embed=event_board_embed(ctx), allowed_mentions=discord.AllowedMentions.none())
+        return msg
+    except Exception:
+        return None
+
+
+async def require_event_post_here(interaction: discord.Interaction, tournament: str, event: str) -> tuple[bool, Optional[dict[str, Any]], str]:
+    ctx = await run_db(event_context, int(interaction.guild_id or GUILD_ID), tournament, event)
+    if not ctx:
+        return False, None, "event_not_found"
+    e = ctx["event"]
+    if not (e.get("public_channel_id") and (e.get("public_message_id") or e.get("bracket_message_id"))):
+        return False, ctx, "no_event_post"
+    if int(e.get("public_channel_id")) != int(interaction.channel_id or 0):
+        return False, ctx, "wrong_event_post"
+    return True, ctx, ""
 
 
 def format_results_lines(results: list[dict[str, Any]], limit: int = 10) -> list[str]:
@@ -1241,7 +1292,7 @@ async def tourney_create(interaction: discord.Interaction, name: str, host_kingd
 
 
 
-@tree.command(name="tourney-event-add", description="Staff: create/link an event to the discussion post where this command is run.", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="tourney-event-add", description="Staff: create an event definition for a tournament.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
 @app_commands.autocomplete(tournament=tourney_auto)
@@ -1249,19 +1300,35 @@ async def tourney_create(interaction: discord.Interaction, name: str, host_kingd
 async def tourney_event_add(interaction: discord.Interaction, tournament: str, name: str, event_type: app_commands.Choice[str], max_entrants: Optional[int] = None):
     await interaction.response.defer(ephemeral=True)
     gid = int(interaction.guild_id or GUILD_ID)
-    res = await run_db(add_event, gid, tournament, name, event_type.value, max_entrants, interaction.channel_id)
+    res = await run_db(add_event, gid, tournament, name, event_type.value, max_entrants, None)
     if not res.get("ok"):
         await interaction.followup.send("Tournament not found.", ephemeral=True)
         return
-    ctx = await run_db(event_context, gid, tournament, name)
-    if ctx:
-        sent = await event_post(ctx["event"], event_board_embed(ctx))
-        if sent:
-            await run_db(set_event_board_message, gid, int(ctx["event"]["id"]), int(sent.id))
     await interaction.followup.send(
-        f"Added **{clean(name)}** as **{event_label(event_type.value)}** and linked it to this event post.",
+        f"Added **{clean(name)}** as **{event_label(event_type.value)}**. Run `/post-event` inside the desired discussion/forum post to create the live bracket/contestant board.",
         ephemeral=True,
     )
+
+
+@tree.command(name="post-event", description="Staff: post and link the live bracket/contestant board in this channel/post.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
+@staff_only()
+@app_commands.autocomplete(tournament=tourney_auto, event=event_auto)
+async def post_event(interaction: discord.Interaction, tournament: str, event: str):
+    await interaction.response.defer(ephemeral=True)
+    gid = int(interaction.guild_id or GUILD_ID)
+    ctx = await run_db(event_context, gid, tournament, event)
+    if not ctx:
+        await interaction.followup.send("Tournament/event not found.", ephemeral=True)
+        return
+    emb = event_board_embed(ctx)
+    try:
+        msg = await interaction.channel.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())  # type: ignore[union-attr]
+    except Exception:
+        await interaction.followup.send("Could not post the event board here. Check channel permissions.", ephemeral=True)
+        return
+    await run_db(link_event_board_message, gid, int(ctx["event"]["id"]), int(interaction.channel_id or msg.channel.id), int(msg.id))
+    await interaction.followup.send("Event board posted and linked. Registrations and round results will update this post.", ephemeral=True)
 
 
 @tree.command(name="tourney-register", description="Register one of your characters for a tournament event.", guild=discord.Object(id=GUILD_ID))
@@ -1334,6 +1401,15 @@ async def post_announcement(interaction: discord.Interaction, tournament: str):
 async def tourney_run_match(interaction: discord.Interaction, tournament: str, event: str):
     await interaction.response.defer(ephemeral=True)
     gid = int(interaction.guild_id or GUILD_ID)
+    ok, _ctx, reason = await require_event_post_here(interaction, tournament, event)
+    if not ok:
+        if reason == "no_event_post":
+            await interaction.followup.send("No event board is linked yet. Run `/post-event` inside this event's discussion/forum post first.", ephemeral=True)
+        elif reason == "wrong_event_post":
+            await interaction.followup.send("Run this command inside the linked event discussion/forum post.", ephemeral=True)
+        else:
+            await interaction.followup.send("Tournament/event not found.", ephemeral=True)
+        return
     res = await run_db(run_match_db, gid, tournament, event)
     if not res.get("ok"):
         await interaction.followup.send(f"Could not run match: `{clean(res.get('reason'))}`.", ephemeral=True)
@@ -1347,7 +1423,7 @@ async def tourney_run_match(interaction: discord.Interaction, tournament: str, e
     content = f"<@{int(res['winner'].user_id)}> vs <@{int(res['loser'].user_id)}>"
     await event_post(e, emb, content=content, mention_users=True)
     await update_event_board(gid, tournament, event)
-    msg = "Match resolved in the event post."
+    msg = "Match resolved and posted in this event post."
     if res.get("final_ready"):
         msg += " This event is ready to finalize."
     await interaction.followup.send(msg, ephemeral=True)
@@ -1360,6 +1436,15 @@ async def tourney_run_match(interaction: discord.Interaction, tournament: str, e
 async def tourney_run_round(interaction: discord.Interaction, tournament: str, event: str):
     await interaction.response.defer(ephemeral=True)
     gid = int(interaction.guild_id or GUILD_ID)
+    ok, _ctx, reason = await require_event_post_here(interaction, tournament, event)
+    if not ok:
+        if reason == "no_event_post":
+            await interaction.followup.send("No event board is linked yet. Run `/post-event` inside this event's discussion/forum post first.", ephemeral=True)
+        elif reason == "wrong_event_post":
+            await interaction.followup.send("Run this command inside the linked event discussion/forum post.", ephemeral=True)
+        else:
+            await interaction.followup.send("Tournament/event not found.", ephemeral=True)
+        return
     res = await run_db(run_open_round_db, gid, tournament, event)
     if not res.get("ok"):
         await interaction.followup.send(f"Could not run round: `{clean(res.get('reason'))}`.", ephemeral=True)
@@ -1373,7 +1458,7 @@ async def tourney_run_round(interaction: discord.Interaction, tournament: str, e
     emb.set_footer(text="Safe tournament mode: all injuries are narrative-only.")
     await event_post(e, emb)
     await update_event_board(gid, tournament, event)
-    msg = "Round resolved in the event post."
+    msg = "Round resolved and posted in this event post."
     if res.get("final_ready"):
         msg += " This event is ready to finalize."
     await interaction.followup.send(msg, ephemeral=True)
