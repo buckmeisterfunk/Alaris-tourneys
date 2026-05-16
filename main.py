@@ -15,7 +15,7 @@ from discord import app_commands
 import psycopg
 from psycopg.rows import dict_row
 
-APP_VERSION = "Alaris_TournamentBot_v004"
+APP_VERSION = "Alaris_TournamentBot_v005"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] TourneyBot: %(message)s")
 LOG = logging.getLogger("TourneyBot")
@@ -83,17 +83,17 @@ ECON_LOG_CHANNEL_ID = env_int("ECON_LOG_CHANNEL_ID", 1504528860237136022)
 XP_LOG_CHANNEL_ID = env_int("XP_LOG_CHANNEL_ID", 1500571564217860177)
 
 # Reward placeholders. Defaults are intentionally 0 until reward tuning is locked.
-PARTICIPATION_XP = env_int("TOURNEY_PARTICIPATION_XP", 0) or 0
-THIRD_XP = env_int("TOURNEY_THIRD_XP", 0) or 0
-RUNNER_UP_XP = env_int("TOURNEY_RUNNER_UP_XP", 0) or 0
-EVENT_WIN_XP = env_int("TOURNEY_EVENT_WIN_XP", 0) or 0
-OVERALL_WIN_XP = env_int("TOURNEY_OVERALL_WIN_XP", 0) or 0
+PARTICIPATION_XP = env_int("TOURNEY_PARTICIPATION_XP", 25) or 25
+THIRD_XP = env_int("TOURNEY_THIRD_XP", 50) or 50
+RUNNER_UP_XP = env_int("TOURNEY_RUNNER_UP_XP", 75) or 75
+EVENT_WIN_XP = env_int("TOURNEY_EVENT_WIN_XP", 125) or 125
+OVERALL_WIN_XP = env_int("TOURNEY_OVERALL_WIN_XP", 200) or 200
 
-PARTICIPATION_PAY = env_int("TOURNEY_PARTICIPATION_EMBERS", 0) or 0
-THIRD_PAY = env_int("TOURNEY_THIRD_EMBERS", 0) or 0
-RUNNER_PAY = env_int("TOURNEY_RUNNER_UP_EMBERS", 0) or 0
-EVENT_WIN_PAY = env_int("TOURNEY_EVENT_WIN_EMBERS", 0) or 0
-OVERALL_WIN_PAY = env_int("TOURNEY_OVERALL_WIN_EMBERS", 0) or 0
+PARTICIPATION_PAY = env_int("TOURNEY_PARTICIPATION_EMBERS", 50) or 50
+THIRD_PAY = env_int("TOURNEY_THIRD_EMBERS", 150) or 150
+RUNNER_PAY = env_int("TOURNEY_RUNNER_UP_EMBERS", 250) or 250
+EVENT_WIN_PAY = env_int("TOURNEY_EVENT_WIN_EMBERS", 500) or 500
+OVERALL_WIN_PAY = env_int("TOURNEY_OVERALL_WIN_EMBERS", 1000) or 1000
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN")
