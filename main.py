@@ -806,6 +806,27 @@ async def edit_announcement_message(channel_id: Optional[int], message_id: Optio
         LOG.warning("Could not edit tournament announcement %s/%s: %s", channel_id, message_id, exc)
         return False
 
+async def update_tournament_announcement(guild_id: int, tournament: str) -> bool:
+    """Silently refresh the original opening announcement with live event counts.
+
+    This is called after registration/withdrawal and never pings the role.
+    If the tournament was opened before announcement IDs existed, it fails safely.
+    """
+    try:
+        status = await run_db(tournament_status, int(guild_id), str(tournament))
+        if not status:
+            return False
+        t = status.get("tournament") or {}
+        channel_id = t.get("announcement_channel_id")
+        message_id = t.get("announcement_message_id")
+        if not channel_id or not message_id:
+            return False
+        embed = tournament_open_announcement_embed(status)
+        return await edit_announcement_message(int(channel_id), int(message_id), embed)
+    except Exception as exc:
+        LOG.warning("Could not refresh tournament announcement for %s: %s", tournament, exc)
+        return False
+
 
 async def event_post(event: dict[str, Any], embed: discord.Embed, *, content: Optional[str] = None, mention_users: bool = False):
     channel_id = event.get("public_channel_id")
@@ -899,7 +920,7 @@ def tournament_close_announcement_embed(result: dict[str, Any]) -> discord.Embed
         lines = [f"{i}. **{clean(r['name'])}** — {int(r['score'] or 0)} pts" for i, r in enumerate(standings[:10], start=1)]
         emb.add_field(name="Overall Standings", value="\n".join(lines), inline=False)
     if result.get("reward_ledger"):
-        add_reward_ledger_field(emb, result.get("reward_ledger") or [], title="Overall Champion Reward")
+        add_reward_ledger_field(emb, result.get("reward_ledger") or [], title="Tournament Reward Ledger")
     emb.set_footer(text="Tournament rewards have been routed through the economy and XP systems.")
     return emb
 
@@ -1074,7 +1095,7 @@ def tournament_status(guild_id: int, tournament: str) -> Optional[dict[str, Any]
             events = [dict(r) for r in cur.fetchall()]
             metrics = {}
             for e in events:
-                cur.execute("SELECT COUNT(*) AS n FROM tourney.entries WHERE guild_id=%s AND event_id=%s AND registration_status='registered';", (guild_id, e["id"]))
+                cur.execute("SELECT COUNT(*) AS n FROM tourney.entries WHERE guild_id=%s AND event_id=%s AND registration_status <> 'withdrawn';", (guild_id, e["id"]))
                 metrics[int(e["id"])] = int(cur.fetchone()["n"] or 0)
     return {"tournament": dict(t), "events": events, "metrics": metrics}
 
@@ -1112,7 +1133,7 @@ def register(guild_id: int, tournament: str, event: str, character: str, actor: 
             if existing and existing.get("registration_status") != "withdrawn":
                 return {"ok": False, "reason": "already_registered"}
 
-            cur.execute("SELECT COUNT(*) AS n FROM tourney.entries WHERE guild_id=%s AND event_id=%s AND registration_status='registered';", (guild_id, e["id"]))
+            cur.execute("SELECT COUNT(*) AS n FROM tourney.entries WHERE guild_id=%s AND event_id=%s AND registration_status <> 'withdrawn';", (guild_id, e["id"]))
             if e.get("max_entrants") and int(cur.fetchone()["n"] or 0) >= int(e["max_entrants"]):
                 return {"ok": False, "reason": "event_full"}
 
@@ -1467,6 +1488,12 @@ def run_open_round_db(guild_id: int, tournament: str, event: str) -> dict[str, A
     return {"ok": True, "tournament": t, "event": e, "results": results, "lines": lines, "final_ready": final_ready}
 
 def finalize_event_db(guild_id: int, tournament: str, event: str, actor: int) -> dict[str, Any]:
+    """Finalize an event result only.
+
+    v018 change: event finalization does NOT pay XP, renown/prestige, or currency.
+    It only locks the event result and advances tournament state. All rewards are
+    calculated, paid, and logged once when the full tournament is finalized.
+    """
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament))
@@ -1482,92 +1509,209 @@ def finalize_event_db(guild_id: int, tournament: str, event: str, actor: int) ->
             if e["status"] != "ready_to_finalize":
                 return {"ok": False, "reason": "not_ready"}
             cur.execute("""
-                SELECT er.*, c.name FROM tourney.event_results er
-                JOIN public.characters c ON c.guild_id=er.guild_id AND c.character_id=er.character_id
-                WHERE er.guild_id=%s AND er.event_id=%s ORDER BY er.place ASC;
+                SELECT er.*, c.name
+                  FROM tourney.event_results er
+                  JOIN public.characters c ON c.guild_id=er.guild_id AND c.character_id=er.character_id
+                 WHERE er.guild_id=%s AND er.event_id=%s
+                 ORDER BY er.place ASC;
             """, (guild_id, e["id"]))
             rows = [dict(r) for r in cur.fetchall()]
             if not rows:
                 return {"ok": False, "reason": "no_results"}
-            total_pay = 0
-            total_xp = 0
-            reward_ledger: list[dict[str, Any]] = []
-            for r in rows:
-                cid = int(r["character_id"]); place = int(r["place"]); points = EVENT_SCORE.get(place, 0)
-                rp = RP_EVENT_WIN if place == 1 else RP_RUNNER_UP if place == 2 else 0
-                champs = 1 if place == 1 else 0; runners = 1 if place == 2 else 0
-                pay = EVENT_WIN_PAY if place == 1 else RUNNER_PAY if place == 2 else THIRD_PAY if place == 3 else PARTICIPATION_PAY
-                add_rp(cur, guild_id, cid, rp, champs, runners)
-                xp = EVENT_WIN_XP if place == 1 else RUNNER_UP_XP if place == 2 else THIRD_XP if place == 3 else PARTICIPATION_XP
-                econ_pay(cur, guild_id, cid, actor, pay, "tournament_event_payout", {"tournament": tournament, "event": event, "place": place})
-                xp_pay(cur, guild_id, cid, actor, xp, "tournament_event_xp", {"tournament": tournament, "event": event, "place": place})
-                total_pay += pay
-                total_xp += xp
-                reward_ledger.append({
-                    "character_id": cid,
-                    "name": clean(r.get("name")),
-                    "place": place,
-                    "points": points,
-                    "renown": rp,
-                    "pay": pay,
-                    "xp": xp,
-                })
-                cur.execute("""
-                    INSERT INTO tourney.awards (guild_id,tournament_id,event_id,character_id,award_code,award_name,points_awarded,renown_awarded,payout_embers)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s);
-                """, (guild_id, t["id"], e["id"], cid, "event_place", f"{event_label(e['event_type'])} Place {place}", points, rp, pay))
-                cur.execute("INSERT INTO public.alaris_character_refresh_queue (guild_id,character_id,reason) VALUES (%s,%s,'tournament_event_finalized');", (guild_id, cid))
+
+            # Tournament score is already assigned when results are recorded.
+            # Keep event finalization idempotent and reward-free.
             cur.execute("UPDATE tourney.events SET status='completed', updated_at=NOW() WHERE id=%s;", (e["id"],))
             cur.execute("SELECT COUNT(*) AS n FROM tourney.events WHERE guild_id=%s AND tournament_id=%s AND status <> 'completed';", (guild_id, t["id"]))
             open_n = int(cur.fetchone()["n"] or 0)
             cur.execute("UPDATE tourney.tournaments SET status=%s, updated_at=NOW() WHERE id=%s;", ("ready_to_finalize" if open_n == 0 else "active", t["id"]))
         conn.commit()
-    return {"ok": True, "tournament": dict(t), "event": dict(e), "rows": rows, "reward_ledger": reward_ledger, "total_pay": total_pay, "total_xp": total_xp}
+    return {"ok": True, "tournament": dict(t), "event": dict(e), "rows": rows, "reward_ledger": [], "total_pay": 0, "total_xp": 0}
 
 
 def finalize_tournament_db(guild_id: int, tournament: str, actor: int) -> dict[str, Any]:
+    """Finalize a tournament and pay every participant exactly once.
+
+    v018 reward model:
+    - No XP/renown/currency is paid at event finalization.
+    - At tournament close, each character receives one cumulative currency payout,
+      one cumulative XP queue award, and one cumulative renown/prestige update.
+    - Logs can therefore show one clear economy entry and one clear XP entry per character.
+    """
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament))
             t = cur.fetchone()
             if not t:
                 return {"ok": False, "reason": "tournament_not_found"}
+            if t.get("status") == "completed":
+                return {"ok": False, "reason": "already_completed"}
             cur.execute("SELECT COUNT(*) AS n FROM tourney.events WHERE guild_id=%s AND tournament_id=%s AND status <> 'completed';", (guild_id, t["id"]))
             if int(cur.fetchone()["n"] or 0) > 0:
                 return {"ok": False, "reason": "events_not_completed"}
+
             cur.execute("""
                 SELECT en.character_id, c.name, COALESCE(SUM(en.tournament_score),0) AS score
-                FROM tourney.entries en JOIN public.characters c ON c.guild_id=en.guild_id AND c.character_id=en.character_id
-                WHERE en.guild_id=%s AND en.tournament_id=%s AND en.registration_status <> 'withdrawn'
-                GROUP BY en.character_id,c.name ORDER BY score DESC, c.name ASC;
+                  FROM tourney.entries en
+                  JOIN public.characters c ON c.guild_id=en.guild_id AND c.character_id=en.character_id
+                 WHERE en.guild_id=%s AND en.tournament_id=%s AND en.registration_status <> 'withdrawn'
+                 GROUP BY en.character_id,c.name
+                 ORDER BY score DESC, c.name ASC;
             """, (guild_id, t["id"]))
             rows = [dict(r) for r in cur.fetchall()]
             if not rows:
                 return {"ok": False, "reason": "no_entries"}
             champ = rows[0]
-            add_rp(cur, guild_id, int(champ["character_id"]), RP_OVERALL_CHAMPION, overall=1)
-            econ_pay(cur, guild_id, int(champ["character_id"]), actor, OVERALL_WIN_PAY, "tournament_overall_champion_payout", {"tournament": tournament})
-            xp_pay(cur, guild_id, int(champ["character_id"]), actor, OVERALL_WIN_XP, "tournament_overall_champion_xp", {"tournament": tournament})
-            reward_ledger = [{
-                "character_id": int(champ["character_id"]),
-                "name": clean(champ.get("name")),
-                "place": 1,
-                "points": int(champ.get("score") or 0),
-                "renown": RP_OVERALL_CHAMPION,
-                "pay": OVERALL_WIN_PAY,
-                "xp": OVERALL_WIN_XP,
-            }]
-            cut = int(round(OVERALL_WIN_PAY * 0.10)) if OVERALL_WIN_PAY and t.get("host_kingdom") else 0
+            champion_id = int(champ["character_id"])
+
+            # Pull all event entries with placements so rewards can be aggregated per character.
+            cur.execute("""
+                SELECT
+                    en.character_id,
+                    c.name AS character_name,
+                    e.id AS event_id,
+                    e.name AS event_name,
+                    e.event_type,
+                    er.place,
+                    COALESCE(en.tournament_score, 0) AS event_points
+                  FROM tourney.entries en
+                  JOIN tourney.events e ON e.guild_id=en.guild_id AND e.id=en.event_id
+                  JOIN public.characters c ON c.guild_id=en.guild_id AND c.character_id=en.character_id
+             LEFT JOIN tourney.event_results er ON er.guild_id=en.guild_id AND er.event_id=en.event_id AND er.character_id=en.character_id
+                 WHERE en.guild_id=%s
+                   AND en.tournament_id=%s
+                   AND en.registration_status <> 'withdrawn'
+                 ORDER BY c.name ASC, e.id ASC;
+            """, (guild_id, t["id"]))
+            event_rows = [dict(r) for r in cur.fetchall()]
+
+            by_char: dict[int, dict[str, Any]] = {}
+            for r in event_rows:
+                cid = int(r["character_id"])
+                item = by_char.setdefault(cid, {
+                    "character_id": cid,
+                    "name": clean(r.get("character_name")),
+                    "pay": 0,
+                    "xp": 0,
+                    "renown": 0,
+                    "points": 0,
+                    "events_entered": 0,
+                    "event_wins": 0,
+                    "runner_ups": 0,
+                    "third_places": 0,
+                    "overall_champion": False,
+                    "details": [],
+                })
+                place = int(r.get("place") or 0)
+                event_name = clean(r.get("event_name"))
+                points = EVENT_SCORE.get(place, 0)
+
+                # Participation reward for every non-withdrawn event registration.
+                item["events_entered"] += 1
+                item["pay"] += PARTICIPATION_PAY
+                item["xp"] += PARTICIPATION_XP
+                item["points"] += points
+                detail_bits = [f"{event_name}: participation"]
+
+                if place == 1:
+                    item["pay"] += EVENT_WIN_PAY
+                    item["xp"] += EVENT_WIN_XP
+                    item["renown"] += RP_EVENT_WIN
+                    item["event_wins"] += 1
+                    detail_bits.append("event winner")
+                elif place == 2:
+                    item["pay"] += RUNNER_PAY
+                    item["xp"] += RUNNER_UP_XP
+                    item["renown"] += RP_RUNNER_UP
+                    item["runner_ups"] += 1
+                    detail_bits.append("runner-up")
+                elif place == 3:
+                    item["pay"] += THIRD_PAY
+                    item["xp"] += THIRD_XP
+                    item["third_places"] += 1
+                    detail_bits.append("third place")
+
+                item["details"].append(" + ".join(detail_bits))
+
+            if champion_id in by_char:
+                by_char[champion_id]["pay"] += OVERALL_WIN_PAY
+                by_char[champion_id]["xp"] += OVERALL_WIN_XP
+                by_char[champion_id]["renown"] += RP_OVERALL_CHAMPION
+                by_char[champion_id]["overall_champion"] = True
+                by_char[champion_id]["details"].append("Overall tournament champion")
+            else:
+                by_char[champion_id] = {
+                    "character_id": champion_id,
+                    "name": clean(champ.get("name")),
+                    "pay": OVERALL_WIN_PAY,
+                    "xp": OVERALL_WIN_XP,
+                    "renown": RP_OVERALL_CHAMPION,
+                    "points": int(champ.get("score") or 0),
+                    "events_entered": 0,
+                    "event_wins": 0,
+                    "runner_ups": 0,
+                    "third_places": 0,
+                    "overall_champion": True,
+                    "details": ["Overall tournament champion"],
+                }
+
+            reward_ledger = sorted(by_char.values(), key=lambda x: (-int(x.get("points") or 0), clean(x.get("name"))))
+            total_pay = 0
+            total_xp = 0
+            total_renown = 0
+            for item in reward_ledger:
+                cid = int(item["character_id"])
+                pay = int(item.get("pay") or 0)
+                xp = int(item.get("xp") or 0)
+                renown = int(item.get("renown") or 0)
+                event_wins = int(item.get("event_wins") or 0)
+                runners = int(item.get("runner_ups") or 0)
+                overall = 1 if item.get("overall_champion") else 0
+                total_pay += pay
+                total_xp += xp
+                total_renown += renown
+
+                if renown:
+                    add_rp(cur, guild_id, cid, renown, champs=event_wins, runners=runners, overall=overall)
+                if pay:
+                    econ_pay(cur, guild_id, cid, actor, pay, "tournament_total_payout", {
+                        "tournament": tournament,
+                        "events_entered": int(item.get("events_entered") or 0),
+                        "event_wins": event_wins,
+                        "runner_ups": runners,
+                        "third_places": int(item.get("third_places") or 0),
+                        "overall_champion": bool(item.get("overall_champion")),
+                        "details": item.get("details") or [],
+                    })
+                if xp:
+                    xp_pay(cur, guild_id, cid, actor, xp, "tournament_total_xp", {
+                        "tournament": tournament,
+                        "events_entered": int(item.get("events_entered") or 0),
+                        "event_wins": event_wins,
+                        "runner_ups": runners,
+                        "third_places": int(item.get("third_places") or 0),
+                        "overall_champion": bool(item.get("overall_champion")),
+                        "details": item.get("details") or [],
+                        "reason": f"Tournament rewards for {clean(tournament)}",
+                    })
+                cur.execute("INSERT INTO public.alaris_character_refresh_queue (guild_id,character_id,reason) VALUES (%s,%s,'tournament_finalized');", (guild_id, cid))
+                cur.execute("""
+                    INSERT INTO tourney.awards (guild_id,tournament_id,event_id,character_id,award_code,award_name,points_awarded,renown_awarded,payout_embers)
+                    VALUES (%s,%s,NULL,%s,'tournament_total_rewards',%s,%s,%s,%s);
+                """, (guild_id, t["id"], cid, f"Tournament Rewards — {clean(tournament)}", int(item.get("points") or 0), renown, pay))
+
+            cut = int(round(total_pay * 0.10)) if total_pay and t.get("host_kingdom") else 0
             if cut:
                 cur.execute("""
                     INSERT INTO econ.kingdoms (guild_id,kingdom,treasury_embers,updated_at)
                     VALUES (%s,%s,%s,NOW())
                     ON CONFLICT (guild_id,kingdom) DO UPDATE SET treasury_embers=econ.kingdoms.treasury_embers+EXCLUDED.treasury_embers, updated_at=NOW();
                 """, (guild_id, t["host_kingdom"], cut))
-            cur.execute("""
-                INSERT INTO tourney.awards (guild_id,tournament_id,event_id,character_id,award_code,award_name,points_awarded,renown_awarded,payout_embers)
-                VALUES (%s,%s,NULL,%s,'overall_champion',%s,%s,%s,%s);
-            """, (guild_id, t["id"], int(champ["character_id"]), f"Overall Champion of {clean(tournament)}", int(champ["score"] or 0), RP_OVERALL_CHAMPION, OVERALL_WIN_PAY))
+                cur.execute("""
+                    INSERT INTO econ.transactions (guild_id, character_id, actor_user_id, action, amount_embers, details_json)
+                    VALUES (%s,NULL,%s,'tournament_host_treasury_cut',%s,%s::jsonb);
+                """, (guild_id, actor, cut, json.dumps({"tournament": tournament, "host_kingdom": t.get("host_kingdom"), "total_tournament_payout": total_pay})))
+
             cur.execute("UPDATE tourney.tournaments SET status='completed', updated_at=NOW() WHERE id=%s;", (t["id"],))
             cur.execute("""
                 SELECT e.name AS event_name, e.event_type, c.name AS winner_name, er.character_id
@@ -1579,10 +1723,18 @@ def finalize_tournament_db(guild_id: int, tournament: str, actor: int) -> dict[s
             """, (guild_id, t["id"]))
             event_winners = [dict(r) for r in cur.fetchall()]
         conn.commit()
-    return {"ok": True, "tournament": dict(t), "standings": rows, "champion": champ, "event_winners": event_winners, "reward_ledger": reward_ledger, "payout": OVERALL_WIN_PAY, "cut": cut, "xp": OVERALL_WIN_XP}
-
-
-
+    return {
+        "ok": True,
+        "tournament": dict(t),
+        "standings": rows,
+        "champion": champ,
+        "event_winners": event_winners,
+        "reward_ledger": reward_ledger,
+        "payout": total_pay,
+        "cut": cut,
+        "xp": total_xp,
+        "renown": total_renown,
+    }
 
 def force_close_tournament_db(guild_id: int, tournament: str, actor: int, reason: str = "") -> dict[str, Any]:
     """Emergency close a stuck tournament without deleting records."""
@@ -1979,7 +2131,7 @@ def register_many(guild_id: int, tournament: str, event_names: list[str], charac
                     skipped.append({"event": event_name, "reason": "already_registered"})
                     continue
 
-                cur.execute("SELECT COUNT(*) AS n FROM tourney.entries WHERE guild_id=%s AND event_id=%s AND registration_status='registered';", (guild_id, e["id"]))
+                cur.execute("SELECT COUNT(*) AS n FROM tourney.entries WHERE guild_id=%s AND event_id=%s AND registration_status <> 'withdrawn';", (guild_id, e["id"]))
                 if e.get("max_entrants") and int(cur.fetchone()["n"] or 0) >= int(e["max_entrants"]):
                     skipped.append({"event": event_name, "reason": "event_full"})
                     continue
@@ -2327,11 +2479,7 @@ async def tourney_finalize_event(interaction: discord.Interaction, tournament: s
     if res.get("event"):
         await event_post(res["event"], emb)
     await update_event_board(int(interaction.guild_id or GUILD_ID), tournament, event)
-    if int(res.get("total_pay") or 0):
-        await log_econ([f"Event: **{clean(event)}**", *reward_ledger_lines(res.get("reward_ledger") or []), f"Total paid: **{fmt_money(int(res['total_pay']))}**"])
-    if int(res.get("total_xp") or 0):
-        await log_xp([f"Event: **{clean(event)}**", *reward_ledger_lines(res.get("reward_ledger") or []), f"Total XP queued: **{int(res['total_xp']):,}**"])
-    await interaction.followup.send("Event finalized. Results were posted in the linked event post; no announcement ping was sent.", ephemeral=True)
+    await interaction.followup.send("Event finalized. Results were posted in the linked event post. Rewards are deferred until the tournament is finalized.", ephemeral=True)
 
 
 @tree.command(name="tourney-finalize", description="Staff: finalize the tournament and announce all event winners plus the overall champion.", guild=discord.Object(id=GUILD_ID))
@@ -2347,11 +2495,40 @@ async def tourney_finalize(interaction: discord.Interaction, tournament: str):
     champ = res["champion"]
     emb = tournament_close_announcement_embed(res)
     await announcement_post(emb, ping_role=True)
-    if int(res.get("payout") or 0):
-        await log_econ([f"Tournament: **{clean(tournament)}**", *reward_ledger_lines(res.get("reward_ledger") or [], include_place=False), f"Host treasury cut: **{fmt_money(int(res.get('cut') or 0))}**"])
-    if int(res.get("xp") or 0):
-        await log_xp([f"Tournament: **{clean(tournament)}**", *reward_ledger_lines(res.get("reward_ledger") or [], include_place=False)])
-    await interaction.followup.send("Tournament finalized. Closing announcement posted and tournament role pinged.", ephemeral=True)
+    ledger = res.get("reward_ledger") or []
+    for item in ledger:
+        name = clean(item.get("name") or "Unknown Character")
+        pay = int(item.get("pay") or 0)
+        xp = int(item.get("xp") or 0)
+        renown = int(item.get("renown") or 0)
+        events_entered = int(item.get("events_entered") or 0)
+        event_wins = int(item.get("event_wins") or 0)
+        runner_ups = int(item.get("runner_ups") or 0)
+        third_places = int(item.get("third_places") or 0)
+        overall = bool(item.get("overall_champion"))
+        details = item.get("details") or []
+        detail_text = "; ".join(clean(x) for x in details[:6]) or "Tournament participation"
+        if pay:
+            await log_econ([
+                f"Tournament: **{clean(tournament)}**",
+                f"Character: **{name}**",
+                f"Currency awarded: **{fmt_money(pay)}**",
+                f"Prestige/Renown awarded: **+{renown} RP**",
+                f"Events entered: **{events_entered}** | Event wins: **{event_wins}** | Runner-up: **{runner_ups}** | Third: **{third_places}** | Overall Champion: **{'Yes' if overall else 'No'}**",
+                f"Breakdown: {detail_text}",
+            ])
+        if xp:
+            await log_xp([
+                f"Tournament: **{clean(tournament)}**",
+                f"Character: **{name}**",
+                f"XP queued: **{xp:,} XP**",
+                f"Prestige/Renown awarded: **+{renown} RP**",
+                f"Events entered: **{events_entered}** | Event wins: **{event_wins}** | Runner-up: **{runner_ups}** | Third: **{third_places}** | Overall Champion: **{'Yes' if overall else 'No'}**",
+                f"Breakdown: {detail_text}",
+            ])
+    if int(res.get("cut") or 0):
+        await log_econ([f"Tournament: **{clean(tournament)}**", f"Host treasury cut: **{fmt_money(int(res.get('cut') or 0))}**", f"Based on total tournament payout: **{fmt_money(int(res.get('payout') or 0))}**"])
+    await interaction.followup.send("Tournament finalized. Closing announcement posted, tournament role pinged, and per-character XP/economy logs were posted.", ephemeral=True)
 
 
 @tree.command(name="tourney-force-close", description="Staff emergency: force-close a stuck tournament without deleting records.", guild=discord.Object(id=GUILD_ID))
