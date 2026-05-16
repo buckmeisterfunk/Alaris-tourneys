@@ -1,570 +1,1116 @@
-
 from __future__ import annotations
-import os, re, json, random, asyncio, logging, traceback
+
+import asyncio
+import json
+import logging
+import os
+import random
+import re
+import traceback
 from dataclasses import dataclass
 from typing import Any, Optional
+
 import discord
 from discord import app_commands
 import psycopg
 from psycopg.rows import dict_row
 
-APP_VERSION='Alaris_TournamentBot_v002'
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] TourneyBot: %(message)s')
-log=logging.getLogger('TourneyBot')
-CANON_KINGDOMS=['Ephel Duath','Galadon','Mullaghmore','Frerinn','Vornladuhr','Vidalia','Idolea','Chiron']
-EVENT_TYPES={'joust':('Joust','head_to_head'),'archery':('Archery','scored_round'),'grand_melee':('Grand Melee','scored_round'),'duel':('Duel','head_to_head'),'horse_race':('Horse Race','scored_round'),'hunt':('Hunt','scored_round')}
-EVENT_CHOICES=[app_commands.Choice(name=v[0], value=k) for k,v in EVENT_TYPES.items()]
-KINGDOM_CHOICES=[app_commands.Choice(name=k,value=k) for k in CANON_KINGDOMS]
-RANKS=[(0,'Newcomer',0),(10,'Proven',1),(25,'Seasoned',2),(50,'Renowned',3),(90,'Champion',4),(150,'Legend',5)]
-CURRENCY=[(100000000,'Astral','Astrals'),(1000000,'Throne','Thrones'),(10000,'Sovereign','Sovereigns'),(100,'Crown','Crowns'),(1,'Ember','Embers')]
+APP_VERSION = "Alaris_TournamentBot_v003"
 
-def env(n,d=None):
-    v=os.getenv(n); return d if v is None or not v.strip() else v.strip()
-def env_int(n,d=None):
-    v=env(n); 
-    if v is None: return d
-    s=re.sub(r'[^0-9]','',v); return int(s) if s else d
-def env_ids(*names):
-    out=set()
-    for n in names:
-        for p in (env(n,'') or '').replace(';',',').split(','):
-            s=re.sub(r'[^0-9]','',p)
-            if s: out.add(int(s))
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] TourneyBot: %(message)s")
+LOG = logging.getLogger("TourneyBot")
+
+CANON_KINGDOMS = ["Ephel Duath", "Galadon", "Mullaghmore", "Frerinn", "Vornladuhr", "Vidalia", "Idolea", "Chiron"]
+
+# Locked six events. Values are canonical database keys in v003.
+EVENT_TYPES: dict[str, dict[str, str]] = {
+    "grand_melee": {"label": "Grand Melee", "category": "combat_mass"},
+    "duel": {"label": "Duel", "category": "combat_duel"},
+    "jousting": {"label": "Jousting", "category": "mounted_impact"},
+    "archery": {"label": "Archery", "category": "precision"},
+    "great_hunt": {"label": "Great Hunt", "category": "pve_hunt"},
+    "horse_racing": {"label": "Horse Racing", "category": "mounted_race"},
+}
+EVENT_CHOICES = [app_commands.Choice(name=v["label"], value=k) for k, v in EVENT_TYPES.items()]
+KINGDOM_CHOICES = [app_commands.Choice(name=k, value=k) for k in CANON_KINGDOMS]
+
+# Renown is prestige only in v003. It is used for seeding and flavor, not combat power.
+RANKS = [(0, "Newcomer"), (10, "Proven"), (25, "Seasoned"), (50, "Renowned"), (90, "Champion"), (150, "Legend")]
+EVENT_SCORE = {1: 5, 2: 3, 3: 2}
+RP_EVENT_WIN = 3
+RP_RUNNER_UP = 1
+RP_OVERALL_CHAMPION = 5
+
+CURRENCY = [(100000000, "Astral", "Astrals"), (1000000, "Throne", "Thrones"), (10000, "Sovereign", "Sovereigns"), (100, "Crown", "Crowns"), (1, "Ember", "Embers")]
+
+
+def env(name: str, default: Optional[str] = None) -> Optional[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    return raw if raw else default
+
+
+def env_int(name: str, default: Optional[int] = None) -> Optional[int]:
+    raw = env(name)
+    if raw is None:
+        return default
+    cleaned = re.sub(r"[^0-9]", "", raw)
+    return int(cleaned) if cleaned else default
+
+
+def env_ids(*names: str) -> set[int]:
+    out: set[int] = set()
+    for name in names:
+        raw = env(name, "") or ""
+        for part in raw.replace(";", ",").replace("\n", ",").split(","):
+            cleaned = re.sub(r"[^0-9]", "", part)
+            if cleaned:
+                out.add(int(cleaned))
     return out
-DISCORD_TOKEN=env('DISCORD_TOKEN'); DATABASE_URL=env('DATABASE_URL'); GUILD_ID=env_int('GUILD_ID')
-STAFF_ROLE_IDS=env_ids('TOURNEY_STAFF_ROLE_IDS','STAFF_ROLE_IDS')
-PUBLIC_CHANNEL_ID=env_int('TOURNEY_PUBLIC_CHANNEL_ID'); LOG_CHANNEL_ID=env_int('TOURNEY_LOG_CHANNEL_ID'); ECON_LOG_CHANNEL_ID=env_int('ECON_LOG_CHANNEL_ID',1504528860237136022)
-EVENT_CHAMPION_PAY=env_int('TOURNEY_EVENT_CHAMPION_REWARD_EMBERS',0) or 0
-EVENT_RUNNER_PAY=env_int('TOURNEY_EVENT_RUNNER_UP_REWARD_EMBERS',0) or 0
-OVERALL_CHAMPION_PAY=env_int('TOURNEY_OVERALL_CHAMPION_REWARD_EMBERS',0) or 0
-if not DISCORD_TOKEN: raise RuntimeError('Missing DISCORD_TOKEN')
-if not DATABASE_URL: raise RuntimeError('Missing DATABASE_URL')
-if not GUILD_ID: raise RuntimeError('Missing GUILD_ID')
-intents=discord.Intents.default(); intents.members=True
-client=discord.Client(intents=intents); tree=app_commands.CommandTree(client)
+
+
+DISCORD_TOKEN = env("DISCORD_TOKEN")
+DATABASE_URL = env("DATABASE_URL")
+GUILD_ID = env_int("GUILD_ID")
+STAFF_ROLE_IDS = env_ids("TOURNEY_STAFF_ROLE_IDS", "STAFF_ROLE_IDS")
+PUBLIC_CHANNEL_ID = env_int("TOURNEY_PUBLIC_CHANNEL_ID")
+LOG_CHANNEL_ID = env_int("TOURNEY_LOG_CHANNEL_ID")
+ECON_LOG_CHANNEL_ID = env_int("ECON_LOG_CHANNEL_ID", 1504528860237136022)
+EVENT_CHAMPION_PAY = env_int("TOURNEY_EVENT_CHAMPION_REWARD_EMBERS", 0) or 0
+EVENT_RUNNER_PAY = env_int("TOURNEY_EVENT_RUNNER_UP_REWARD_EMBERS", 0) or 0
+OVERALL_CHAMPION_PAY = env_int("TOURNEY_OVERALL_CHAMPION_REWARD_EMBERS", 0) or 0
+
+if not DISCORD_TOKEN:
+    raise RuntimeError("Missing DISCORD_TOKEN")
+if not DATABASE_URL:
+    raise RuntimeError("Missing DATABASE_URL")
+if not GUILD_ID:
+    raise RuntimeError("Missing or invalid GUILD_ID")
+
+intents = discord.Intents.default()
+intents.members = True
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+
+
 @dataclass(frozen=True)
-class CRef: guild_id:int; character_id:int; user_id:int; name:str; kingdom:Optional[str]=None
+class CharacterRef:
+    guild_id: int
+    character_id: int
+    user_id: int
+    name: str
+    kingdom: Optional[str]
+    species: Optional[str]
+    class_name: Optional[str]
+    level: int
 
-def clean(x): return str(x or '').replace('`',"'").replace('@','@\u200b').replace('\n',' ').replace('\r',' ').strip()
-def fmt_money(n:int)->str:
-    n=int(n or 0); sign='-' if n<0 else ''; r=abs(n); parts=[]
-    for val,s,p in CURRENCY:
-        q,r=divmod(r,val)
-        if q: parts.append(f'{q:,} {s if q==1 else p}')
-    if not parts: parts=['0 Embers']
-    return sign+', '.join(parts)+f' ({n:,} Copper Embers)'
-def mod(score): return (int(score or 10)-10)//2
-def rank_from_rp(rp:int):
-    name='Newcomer'; bonus=0
-    for th,n,b in RANKS:
-        if int(rp or 0)>=th: name=n; bonus=b
-    return name,bonus
-def roll():
-    a=random.randint(1,6); b=random.randint(1,6); return a,b,a+b
-def db(): return psycopg.connect(DATABASE_URL,row_factory=dict_row)
-async def run_db(fn,*a,**k): return await asyncio.to_thread(fn,*a,**k)
 
-def ensure_schema():
-    with db() as conn, conn.cursor() as cur:
-        cur.execute('CREATE SCHEMA IF NOT EXISTS tourney;')
-        cur.execute('''CREATE TABLE IF NOT EXISTS tourney.tournaments(id BIGSERIAL PRIMARY KEY,guild_id BIGINT NOT NULL,name TEXT NOT NULL,host_kingdom TEXT,status TEXT NOT NULL DEFAULT 'draft',notes TEXT,created_by_user_id BIGINT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(guild_id,name));''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS tourney.events(id BIGSERIAL PRIMARY KEY,guild_id BIGINT NOT NULL,tournament_id BIGINT NOT NULL,name TEXT NOT NULL,event_type TEXT NOT NULL,format_type TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'draft',max_entrants INTEGER,min_entrants INTEGER NOT NULL DEFAULT 2,round_number INTEGER NOT NULL DEFAULT 0,public_channel_id BIGINT,public_message_id BIGINT,settings_json JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(guild_id,tournament_id,name));''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS tourney.entries(id BIGSERIAL PRIMARY KEY,guild_id BIGINT NOT NULL,tournament_id BIGINT NOT NULL,event_id BIGINT NOT NULL,character_id BIGINT NOT NULL,user_id BIGINT NOT NULL,registration_status TEXT NOT NULL DEFAULT 'registered',seed INTEGER,tournament_score INTEGER NOT NULL DEFAULT 0,entered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(guild_id,event_id,character_id));''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS tourney.matches(id BIGSERIAL PRIMARY KEY,guild_id BIGINT NOT NULL,tournament_id BIGINT NOT NULL,event_id BIGINT NOT NULL,round_number INTEGER NOT NULL,match_order INTEGER NOT NULL DEFAULT 1,match_type TEXT NOT NULL DEFAULT 'head_to_head',status TEXT NOT NULL DEFAULT 'pending',winner_character_id BIGINT,narrative_summary TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),completed_at TIMESTAMPTZ,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS tourney.match_participants(id BIGSERIAL PRIMARY KEY,guild_id BIGINT NOT NULL,match_id BIGINT NOT NULL,entry_id BIGINT,character_id BIGINT NOT NULL,slot_number INTEGER NOT NULL DEFAULT 1,final_position INTEGER,eliminated BOOLEAN NOT NULL DEFAULT FALSE,points INTEGER NOT NULL DEFAULT 0,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS tourney.match_rolls(id BIGSERIAL PRIMARY KEY,guild_id BIGINT NOT NULL,match_id BIGINT NOT NULL,character_id BIGINT,phase_code TEXT NOT NULL,roll_formula TEXT NOT NULL,die_1 INTEGER,die_2 INTEGER,base_total INTEGER,modifier_total INTEGER,rank_bonus INTEGER NOT NULL DEFAULT 0,final_total INTEGER,detail_json JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS tourney.competitor_profiles(guild_id BIGINT NOT NULL,character_id BIGINT NOT NULL,renown_points INTEGER NOT NULL DEFAULT 0,events_entered INTEGER NOT NULL DEFAULT 0,match_wins INTEGER NOT NULL DEFAULT 0,event_championships INTEGER NOT NULL DEFAULT 0,event_runner_ups INTEGER NOT NULL DEFAULT 0,overall_championships INTEGER NOT NULL DEFAULT 0,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(guild_id,character_id));''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS tourney.records(guild_id BIGINT NOT NULL,character_id BIGINT NOT NULL,event_type TEXT NOT NULL,entries_count INTEGER NOT NULL DEFAULT 0,wins_count INTEGER NOT NULL DEFAULT 0,runner_up_count INTEGER NOT NULL DEFAULT 0,third_place_count INTEGER NOT NULL DEFAULT 0,points_total INTEGER NOT NULL DEFAULT 0,last_played_at TIMESTAMPTZ,PRIMARY KEY(guild_id,character_id,event_type));''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS tourney.awards(id BIGSERIAL PRIMARY KEY,guild_id BIGINT NOT NULL,tournament_id BIGINT,event_id BIGINT,character_id BIGINT NOT NULL,award_code TEXT NOT NULL,award_name TEXT NOT NULL,points_awarded INTEGER NOT NULL DEFAULT 0,renown_awarded INTEGER NOT NULL DEFAULT 0,payout_embers BIGINT NOT NULL DEFAULT 0,awarded_at TIMESTAMPTZ NOT NULL DEFAULT NOW());''')
-        cur.execute('CREATE SCHEMA IF NOT EXISTS econ;')
-        cur.execute('''CREATE TABLE IF NOT EXISTS econ.balances(guild_id BIGINT NOT NULL,character_id BIGINT NOT NULL,balance_embers BIGINT NOT NULL DEFAULT 0,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(guild_id,character_id));''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS econ.transactions(id BIGSERIAL PRIMARY KEY,guild_id BIGINT NOT NULL,character_id BIGINT,actor_user_id BIGINT,action TEXT NOT NULL,amount_embers BIGINT NOT NULL DEFAULT 0,details_json JSONB NOT NULL DEFAULT '{}'::jsonb,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS econ.kingdoms(guild_id BIGINT NOT NULL,kingdom TEXT NOT NULL,tax_rate_bp INTEGER NOT NULL DEFAULT 1000,treasury_embers BIGINT NOT NULL DEFAULT 0,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(guild_id,kingdom));''')
-        cur.execute('''CREATE TABLE IF NOT EXISTS public.alaris_character_refresh_queue(id BIGSERIAL PRIMARY KEY,guild_id BIGINT NOT NULL,character_id BIGINT NOT NULL,reason TEXT NOT NULL DEFAULT 'tournament_update',requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),processed_at TIMESTAMPTZ);''')
-        for k in CANON_KINGDOMS: cur.execute('INSERT INTO econ.kingdoms(guild_id,kingdom) VALUES(%s,%s) ON CONFLICT DO NOTHING;',(GUILD_ID,k))
-        cur.execute('CREATE INDEX IF NOT EXISTS tourney_events_idx ON tourney.events(guild_id,tournament_id);')
-        cur.execute('CREATE INDEX IF NOT EXISTS tourney_entries_idx ON tourney.entries(guild_id,event_id);')
+def clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("`", "'").replace("@", "@\u200b").replace("\r", " ").replace("\n", " ").strip()
+
+
+def fmt_money(amount: int) -> str:
+    amount = int(amount or 0)
+    sign = "-" if amount < 0 else ""
+    rem = abs(amount)
+    parts = []
+    for val, sing, plur in CURRENCY:
+        q, rem = divmod(rem, val)
+        if q:
+            parts.append(f"{q:,} {sing if q == 1 else plur}")
+    if not parts:
+        parts = ["0 Embers"]
+    return sign + ", ".join(parts) + f" ({amount:,} Copper Embers)"
+
+
+def mod(score: int) -> int:
+    try:
+        return (int(score) - 10) // 2
+    except Exception:
+        return 0
+
+
+def rank_name(rp: int) -> str:
+    name = "Newcomer"
+    for threshold, rn in RANKS:
+        if int(rp or 0) >= threshold:
+            name = rn
+    return name
+
+
+def event_label(key: str) -> str:
+    return EVENT_TYPES.get(key, {}).get("label", clean(key).replace("_", " ").title())
+
+
+def chunk(lines: list[str], limit: int = 1000) -> list[str]:
+    if not lines:
+        return ["—"]
+    out, cur = [], ""
+    for line in lines:
+        line = str(line)
+        cand = line if not cur else cur + "\n" + line
+        if len(cand) > limit:
+            if cur:
+                out.append(cur)
+            cur = line[:limit]
+        else:
+            cur = cand
+    if cur:
+        out.append(cur)
+    return out or ["—"]
+
+
+def db() -> psycopg.Connection:
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+
+async def run_db(fn, *args, **kwargs):
+    return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+def table_columns(cur, table_schema: str, table_name: str) -> set[str]:
+    cur.execute("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema=%s AND table_name=%s;
+    """, (table_schema, table_name))
+    return {str(r["column_name"]) for r in cur.fetchall()}
+
+
+def ensure_schema() -> None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("CREATE SCHEMA IF NOT EXISTS tourney;")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tourney.tournaments (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    name TEXT NOT NULL,
+                    host_kingdom TEXT,
+                    status TEXT NOT NULL DEFAULT 'draft',
+                    notes TEXT,
+                    created_by_user_id BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (guild_id, name)
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tourney.events (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    tournament_id BIGINT NOT NULL,
+                    name TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'draft',
+                    max_entrants INTEGER,
+                    public_channel_id BIGINT,
+                    public_message_id BIGINT,
+                    settings_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (guild_id, tournament_id, name)
+                );
+            """)
+            cur.execute("ALTER TABLE tourney.events ADD COLUMN IF NOT EXISTS format_type TEXT;")
+            cur.execute("ALTER TABLE tourney.events ADD COLUMN IF NOT EXISTS round_number INTEGER NOT NULL DEFAULT 0;")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tourney.entries (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    tournament_id BIGINT NOT NULL,
+                    event_id BIGINT NOT NULL,
+                    character_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    registration_status TEXT NOT NULL DEFAULT 'registered',
+                    seed INTEGER,
+                    tournament_score INTEGER NOT NULL DEFAULT 0,
+                    entered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (guild_id, event_id, character_id)
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tourney.competitor_profiles (
+                    guild_id BIGINT NOT NULL,
+                    character_id BIGINT NOT NULL,
+                    renown_points INTEGER NOT NULL DEFAULT 0,
+                    events_entered INTEGER NOT NULL DEFAULT 0,
+                    event_championships INTEGER NOT NULL DEFAULT 0,
+                    event_runner_ups INTEGER NOT NULL DEFAULT 0,
+                    overall_championships INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, character_id)
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tourney.event_results (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    tournament_id BIGINT NOT NULL,
+                    event_id BIGINT NOT NULL,
+                    character_id BIGINT NOT NULL,
+                    place INTEGER NOT NULL,
+                    score INTEGER NOT NULL DEFAULT 0,
+                    details_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    narrative TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (guild_id, event_id, character_id)
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tourney.awards (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    tournament_id BIGINT,
+                    event_id BIGINT,
+                    character_id BIGINT NOT NULL,
+                    award_code TEXT NOT NULL,
+                    award_name TEXT NOT NULL,
+                    points_awarded INTEGER NOT NULL DEFAULT 0,
+                    renown_awarded INTEGER NOT NULL DEFAULT 0,
+                    payout_embers BIGINT NOT NULL DEFAULT 0,
+                    awarded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS econ.balances (
+                    guild_id BIGINT NOT NULL,
+                    character_id BIGINT NOT NULL,
+                    balance_embers BIGINT NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, character_id)
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS econ.transactions (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    character_id BIGINT,
+                    actor_user_id BIGINT,
+                    action TEXT NOT NULL,
+                    amount_embers BIGINT NOT NULL DEFAULT 0,
+                    details_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS econ.kingdoms (
+                    guild_id BIGINT NOT NULL,
+                    kingdom TEXT NOT NULL,
+                    tax_rate_bp INTEGER NOT NULL DEFAULT 1000,
+                    treasury_embers BIGINT NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, kingdom)
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.alaris_character_refresh_queue (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    character_id BIGINT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT 'tournament_update',
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    processed_at TIMESTAMPTZ
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS tourney_events_idx ON tourney.events (guild_id, tournament_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS tourney_entries_idx ON tourney.entries (guild_id, event_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS tourney_results_idx ON tourney.event_results (guild_id, tournament_id, event_id);")
         conn.commit()
 
-def sync_chars(guild_id:int):
-    with db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT to_regclass('public.alaris_characters') AS t;")
-        if not (cur.fetchone() or {}).get('t'): return {'synced':0,'has_alaris_characters':0}
-        cur.execute('''CREATE TABLE IF NOT EXISTS public.characters(character_id BIGINT PRIMARY KEY,guild_id BIGINT NOT NULL,user_id BIGINT NOT NULL,name TEXT NOT NULL,normalized_name TEXT,species TEXT,class_name TEXT,kingdom TEXT,level INTEGER NOT NULL DEFAULT 1,xp_total BIGINT NOT NULL DEFAULT 0,archived BOOLEAN NOT NULL DEFAULT FALSE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());''')
-        cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS characters_guild_character_id_uidx ON public.characters(guild_id,character_id);')
-        cur.execute('''INSERT INTO public.characters(guild_id,character_id,user_id,name,normalized_name,species,class_name,kingdom,level,xp_total,archived,created_at,updated_at)
-        SELECT guild_id,id,user_id,name,COALESCE(normalized_name,lower(name)),COALESCE(species,''),COALESCE(class_name,''),NULLIF(COALESCE(kingdom,''),''),COALESCE(level,1),COALESCE(xp_total,0),CASE WHEN COALESCE(status,'active')='active' THEN FALSE ELSE TRUE END,COALESCE(created_at,NOW()),NOW()
-        FROM public.alaris_characters WHERE guild_id=%s
-        ON CONFLICT(guild_id,character_id) DO UPDATE SET user_id=EXCLUDED.user_id,name=EXCLUDED.name,kingdom=EXCLUDED.kingdom,level=EXCLUDED.level,xp_total=EXCLUDED.xp_total,archived=EXCLUDED.archived,updated_at=NOW();''',(guild_id,))
-        rc=cur.rowcount; conn.commit(); return {'synced':int(rc or 0),'has_alaris_characters':1}
 
-def fetch_char(guild_id:int,name:str)->Optional[CRef]:
-    with db() as conn, conn.cursor() as cur:
-        cur.execute('SELECT character_id,user_id,name,kingdom FROM public.characters WHERE guild_id=%s AND archived=FALSE AND name=%s LIMIT 1;',(guild_id,name))
-        r=cur.fetchone(); return CRef(guild_id,int(r['character_id']),int(r['user_id']),str(r['name']),r.get('kingdom')) if r else None
-
-def fetch_char_id(guild_id:int,cid:int)->Optional[CRef]:
-    with db() as conn, conn.cursor() as cur:
-        cur.execute('SELECT character_id,user_id,name,kingdom FROM public.characters WHERE guild_id=%s AND archived=FALSE AND character_id=%s LIMIT 1;',(guild_id,cid))
-        r=cur.fetchone(); return CRef(guild_id,int(r['character_id']),int(r['user_id']),str(r['name']),r.get('kingdom')) if r else None
-
-def search_chars(guild_id:int,current:str,owner:Optional[int]=None):
-    where='AND user_id=%s' if owner else ''; params=(guild_id,owner,f'%{current}%') if owner else (guild_id,f'%{current}%')
-    with db() as conn, conn.cursor() as cur:
-        cur.execute(f'SELECT name FROM public.characters WHERE guild_id=%s {where} AND archived=FALSE AND name ILIKE %s ORDER BY name LIMIT 25;',params)
-        return [app_commands.Choice(name=clean(r['name'])[:100], value=clean(r['name'])[:100]) for r in cur.fetchall()]
-
-def _table_columns(cur, table: str) -> set[str]:
-    schema, name = table.split('.', 1)
-    cur.execute(
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = %s AND table_name = %s;
-        """,
-        (schema, name),
-    )
-    return {str(r['column_name']).lower() for r in cur.fetchall()}
+def sync_chars(guild_id: int) -> dict[str, int]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.alaris_characters') AS t;")
+            if not (cur.fetchone() or {}).get("t"):
+                return {"has_alaris_characters": 0, "synced": 0}
+            cur.execute("""
+                INSERT INTO public.characters (
+                    guild_id, character_id, user_id, name, normalized_name, species, class_name,
+                    kingdom, level, xp_total, archived, created_at, updated_at
+                )
+                SELECT guild_id, id, user_id, name, COALESCE(normalized_name, lower(name)), COALESCE(species,''),
+                       COALESCE(class_name,''), NULLIF(COALESCE(kingdom,''), ''), COALESCE(level,1), COALESCE(xp_total,0),
+                       CASE WHEN COALESCE(status,'active')='active' THEN FALSE ELSE TRUE END,
+                       COALESCE(created_at,NOW()), NOW()
+                FROM public.alaris_characters
+                WHERE guild_id=%s
+                ON CONFLICT (guild_id, character_id) DO UPDATE SET
+                    user_id=EXCLUDED.user_id, name=EXCLUDED.name, normalized_name=EXCLUDED.normalized_name,
+                    species=EXCLUDED.species, class_name=EXCLUDED.class_name, kingdom=EXCLUDED.kingdom,
+                    level=EXCLUDED.level, xp_total=EXCLUDED.xp_total, archived=EXCLUDED.archived, updated_at=NOW();
+            """, (guild_id,))
+            n = int(cur.rowcount or 0)
+        conn.commit()
+    return {"has_alaris_characters": 1, "synced": n}
 
 
-def stats_for(guild_id:int,cid:int):
-    """Fetch Alaris stats without assuming every table has guild_id.
+def character_by_name(guild_id: int, name: str) -> Optional[CharacterRef]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT character_id, user_id, name, kingdom, species, class_name, COALESCE(level,1) AS level
+                FROM public.characters
+                WHERE guild_id=%s AND archived=FALSE AND name=%s LIMIT 1;
+            """, (guild_id, name.strip()))
+            r = cur.fetchone()
+            if not r:
+                return None
+            return CharacterRef(guild_id, int(r["character_id"]), int(r["user_id"]), str(r["name"]), r.get("kingdom"), r.get("species"), r.get("class_name"), int(r.get("level") or 1))
 
-    v002 safety fix: live public.alaris_character_stats may be keyed only by
-    character_id/id and may not contain guild_id. We inspect columns first and
-    build the WHERE clause from columns that actually exist.
-    """
-    defaults={'str':10,'dex':10,'con':10,'int':10,'wis':10,'cha':10}
-    aliases={
-        'str':['str','strength','stat_str','stat_strength'],
-        'dex':['dex','dexterity','agility','stat_dex','stat_dexterity'],
-        'con':['con','constitution','endurance','stat_con','stat_constitution'],
-        'int':['int','intelligence','stat_int','stat_intelligence'],
-        'wis':['wis','wisdom','stat_wis','stat_wisdom'],
-        'cha':['cha','charisma','presence','stat_cha','stat_charisma'],
+
+def search_chars(guild_id: int, current: str, owner_id: Optional[int] = None) -> list[app_commands.Choice[str]]:
+    needle = f"%{(current or '').strip()}%"
+    with db() as conn:
+        with conn.cursor() as cur:
+            if owner_id:
+                cur.execute("""
+                    SELECT name FROM public.characters
+                    WHERE guild_id=%s AND user_id=%s AND archived=FALSE AND name ILIKE %s
+                    ORDER BY name LIMIT 25;
+                """, (guild_id, owner_id, needle))
+            else:
+                cur.execute("""
+                    SELECT name FROM public.characters
+                    WHERE guild_id=%s AND archived=FALSE AND name ILIKE %s
+                    ORDER BY name LIMIT 25;
+                """, (guild_id, needle))
+            rows = cur.fetchall()
+    return [app_commands.Choice(name=clean(r["name"])[:100], value=clean(r["name"])[:100]) for r in rows]
+
+
+def search_tourneys(guild_id: int, current: str) -> list[app_commands.Choice[str]]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT name FROM tourney.tournaments
+                WHERE guild_id=%s AND status <> 'completed' AND name ILIKE %s
+                ORDER BY id DESC LIMIT 25;
+            """, (guild_id, f"%{(current or '').strip()}%"))
+            rows = cur.fetchall()
+    return [app_commands.Choice(name=clean(r["name"])[:100], value=clean(r["name"])[:100]) for r in rows]
+
+
+def search_event_names(guild_id: int, tournament_name: Optional[str], current: str) -> list[app_commands.Choice[str]]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            if tournament_name:
+                cur.execute("SELECT id FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament_name))
+                t = cur.fetchone()
+                if not t:
+                    return []
+                cur.execute("""
+                    SELECT name FROM tourney.events WHERE guild_id=%s AND tournament_id=%s AND name ILIKE %s
+                    ORDER BY id DESC LIMIT 25;
+                """, (guild_id, t["id"], f"%{(current or '').strip()}%"))
+            else:
+                cur.execute("""
+                    SELECT name FROM tourney.events WHERE guild_id=%s AND name ILIKE %s
+                    ORDER BY id DESC LIMIT 25;
+                """, (guild_id, f"%{(current or '').strip()}%"))
+            rows = cur.fetchall()
+    return [app_commands.Choice(name=clean(r["name"])[:100], value=clean(r["name"])[:100]) for r in rows]
+
+
+def stats_for(guild_id: int, cid: int) -> dict[str, int]:
+    defaults = {"str": 10, "dex": 10, "con": 10, "int": 10, "wis": 10, "cha": 10}
+    aliases = {
+        "str": ["strength", "str", "stat_strength", "stat_str"],
+        "dex": ["dexterity", "dex", "agility", "stat_dexterity", "stat_dex"],
+        "con": ["constitution", "con", "endurance", "stat_constitution", "stat_con"],
+        "int": ["intelligence", "int", "stat_intelligence", "stat_int"],
+        "wis": ["wisdom", "wis", "stat_wisdom", "stat_wis"],
+        "cha": ["charisma", "cha", "presence", "stat_charisma", "stat_cha"],
     }
-    def norm(row):
-        lower={str(k).lower():v for k,v in dict(row).items()}; out=dict(defaults)
-        for key,names in aliases.items():
-            for n in names:
-                if n in lower and lower[n] is not None:
-                    try:
-                        out[key]=int(lower[n]); break
-                    except Exception:
-                        pass
-        return out
-
-    candidates=[
-        ('public.alaris_character_stats',['character_id','id','alaris_character_id']),
-        ('public.alaris_characters',['id','character_id']),
-        ('public.characters',['character_id','id']),
-    ]
-    with db() as conn, conn.cursor() as cur:
-        for table, id_cols in candidates:
-            cur.execute('SELECT to_regclass(%s) AS t;',(table,))
-            if not (cur.fetchone() or {}).get('t'):
-                continue
-            cols=_table_columns(cur, table)
-            id_col=next((c for c in id_cols if c.lower() in cols), None)
-            if not id_col:
-                continue
-            where=[f'{id_col}=%s']; params=[cid]
-            if 'guild_id' in cols:
-                where.insert(0,'guild_id=%s'); params.insert(0,guild_id)
-            # Avoid archived/inactive rows when the columns exist.
-            if 'archived' in cols:
-                where.append('COALESCE(archived, FALSE) = FALSE')
-            if 'status' in cols:
-                where.append("COALESCE(status, 'active') = 'active'")
-            cur.execute(f"SELECT * FROM {table} WHERE {' AND '.join(where)} LIMIT 1;", tuple(params))
-            r=cur.fetchone()
-            if r:
-                s=norm(r)
-                if s!=defaults or table.endswith('characters'):
-                    return s
+    with db() as conn:
+        with conn.cursor() as cur:
+            # Safely inspect possible stat tables. Never assume guild_id exists.
+            for schema, table, id_cols in [
+                ("public", "alaris_character_stats", ["character_id", "id"]),
+                ("public", "alaris_characters", ["id", "character_id"]),
+                ("public", "characters", ["character_id"]),
+            ]:
+                cur.execute("SELECT to_regclass(%s) AS t;", (f"{schema}.{table}",))
+                if not (cur.fetchone() or {}).get("t"):
+                    continue
+                cols = table_columns(cur, schema, table)
+                id_col = next((c for c in id_cols if c in cols), None)
+                if not id_col:
+                    continue
+                where = [f"{id_col}=%s"]
+                params: list[Any] = [cid]
+                if "guild_id" in cols:
+                    where.insert(0, "guild_id=%s")
+                    params.insert(0, guild_id)
+                sql = f"SELECT * FROM {schema}.{table} WHERE {' AND '.join(where)} LIMIT 1;"
+                cur.execute(sql, tuple(params))
+                row = cur.fetchone()
+                if not row:
+                    continue
+                lower = {str(k).lower(): v for k, v in dict(row).items()}
+                out = dict(defaults)
+                found = False
+                for key, names in aliases.items():
+                    for nm in names:
+                        if nm in lower and lower[nm] is not None:
+                            try:
+                                out[key] = int(lower[nm])
+                                found = True
+                                break
+                            except Exception:
+                                pass
+                if found:
+                    return out
     return defaults
 
-def profile(guild_id:int,cid:int):
-    with db() as conn, conn.cursor() as cur:
-        cur.execute('INSERT INTO tourney.competitor_profiles(guild_id,character_id) VALUES(%s,%s) ON CONFLICT DO NOTHING;',(guild_id,cid))
-        cur.execute('SELECT * FROM tourney.competitor_profiles WHERE guild_id=%s AND character_id=%s;',(guild_id,cid)); r=dict(cur.fetchone()); conn.commit(); return r
 
-def skills(guild_id:int,cid:int):
-    st=stats_for(guild_id,cid); p=profile(guild_id,cid); rn,rb=rank_from_rp(p.get('renown_points',0)); m={k:mod(v) for k,v in st.items()}
-    return {'riding':m['dex']+m['con']+rb,'weapon':m['str']+m['dex']+rb,'archery':m['dex']+m['wis']+rb,'duel':m['str']+m['dex']+m['wis']+rb,'stamina':m['con']+m['str']+rb,'composure':m['wis']+m['cha']+rb,'_rank':rn,'_bonus':rb,'_rp':int(p.get('renown_points') or 0),'_stats':st}
+def profile_for(guild_id: int, cid: int) -> dict[str, Any]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO tourney.competitor_profiles (guild_id, character_id) VALUES (%s,%s) ON CONFLICT DO NOTHING;", (guild_id, cid))
+            cur.execute("SELECT * FROM tourney.competitor_profiles WHERE guild_id=%s AND character_id=%s;", (guild_id, cid))
+            row = cur.fetchone()
+        conn.commit()
+    return dict(row) if row else {"renown_points": 0}
 
-def seed_score(et,sk):
-    return {'joust':sk['riding']*3+sk['weapon']*3+sk['composure']*2,'duel':sk['duel']*3+sk['weapon']*2+sk['stamina']*2,'archery':sk['archery']*4+sk['composure']*2,'horse_race':sk['riding']*4+sk['stamina']*2+sk['composure'],'hunt':sk['archery']*3+sk['stamina']*2+sk['composure']*2,'grand_melee':sk['duel']*3+sk['stamina']*3+sk['weapon']}.get(et,0)
 
-def add_rp(cur,guild_id,cid,rp,**counters):
-    cur.execute('INSERT INTO tourney.competitor_profiles(guild_id,character_id) VALUES(%s,%s) ON CONFLICT DO NOTHING;',(guild_id,cid))
-    parts=['renown_points=renown_points+%s','updated_at=NOW()']; vals=[int(rp)]
-    for k,v in counters.items():
-        if v: parts.append(f'{k}={k}+%s'); vals.append(int(v))
-    vals += [guild_id,cid]
-    cur.execute(f'UPDATE tourney.competitor_profiles SET {", ".join(parts)} WHERE guild_id=%s AND character_id=%s;',tuple(vals))
+def combat_profile(guild_id: int, c: CharacterRef) -> dict[str, Any]:
+    st = stats_for(guild_id, c.character_id)
+    p = profile_for(guild_id, c.character_id)
+    level = max(1, int(c.level or 1))
+    cls = (c.class_name or "").lower()
+    species = (c.species or "").lower()
+    mods = {k: mod(v) for k, v in st.items()}
 
-def queue_refresh(cur,guild_id,cid,reason): cur.execute('INSERT INTO public.alaris_character_refresh_queue(guild_id,character_id,reason) VALUES(%s,%s,%s);',(guild_id,cid,reason))
-def payout(cur,guild_id,cid,actor,amount,action,details):
-    amount=int(amount or 0)
-    if amount<=0: return 0
-    cur.execute('INSERT INTO econ.balances(guild_id,character_id,balance_embers) VALUES(%s,%s,%s) ON CONFLICT(guild_id,character_id) DO UPDATE SET balance_embers=econ.balances.balance_embers+EXCLUDED.balance_embers, updated_at=NOW();',(guild_id,cid,amount))
-    cur.execute('INSERT INTO econ.transactions(guild_id,character_id,actor_user_id,action,amount_embers,details_json) VALUES(%s,%s,%s,%s,%s,%s::jsonb);',(guild_id,cid,actor,action,amount,json.dumps(details)))
-    queue_refresh(cur,guild_id,cid,'tournament_payout'); return amount
+    martial_classes = {"fighter", "barbarian", "paladin", "ranger", "monk", "warden", "captain", "rogue"}
+    caster_classes = {"wizard", "sorcerer", "warlock", "cleric", "druid", "bard", "scholar", "artificer"}
+    hybrid_classes = {"paladin", "ranger", "bard", "artificer", "warlock", "druid", "cleric", "captain"}
+    martial_aff = 2 if cls in martial_classes else 0
+    caster_aff = 2 if cls in caster_classes else 0
+    hybrid_aff = 1 if cls in hybrid_classes else 0
 
-def get_t(cur,guild_id,name): cur.execute('SELECT * FROM tourney.tournaments WHERE guild_id=%s AND name=%s ORDER BY id DESC LIMIT 1;',(guild_id,name)); return cur.fetchone()
-def get_e(cur,guild_id,tid,name): cur.execute('SELECT * FROM tourney.events WHERE guild_id=%s AND tournament_id=%s AND name=%s ORDER BY id DESC LIMIT 1;',(guild_id,tid,name)); return cur.fetchone()
+    hp = 20 + level * 6 + mods["con"] * level + (4 if cls in {"barbarian", "warden", "fighter", "paladin"} else 0)
+    ac = 10 + mods["dex"] + (3 if cls in {"fighter", "paladin", "warden"} else 1 if cls in {"rogue", "ranger", "monk", "barbarian"} else 0)
+    attack = level + max(mods["str"], mods["dex"]) + martial_aff + hybrid_aff
+    spell = level + max(mods["int"], mods["wis"], mods["cha"]) + caster_aff + hybrid_aff
+    defense = ac + mods["con"] + level // 2
+    sustain = hp // 8 + mods["con"] + (2 if cls in {"cleric", "druid", "paladin", "warden", "barbarian"} else 0)
+    burst = max(attack, spell) + (2 if cls in {"sorcerer", "wizard", "rogue", "fighter", "barbarian"} else 0)
+    control = spell + mods["wis"] + (2 if cls in {"wizard", "bard", "warlock", "druid", "scholar"} else 0)
+    mobility = mods["dex"] + level // 2 + (2 if cls in {"rogue", "monk", "ranger", "kitsune"} else 0)
+    precision = mods["dex"] + mods["wis"] + level // 2 + (2 if cls in {"ranger", "rogue", "fighter", "monk"} else 0)
+    riding = mods["dex"] + mods["con"] + level // 2 + (2 if cls in {"paladin", "fighter", "ranger", "captain"} else 0)
+    survival = mods["wis"] + mods["con"] + level // 2 + (2 if cls in {"ranger", "druid", "warden", "barbarian"} else 0)
+    renown = int(p.get("renown_points") or 0)
+    seed_power = renown + level * 3 + max(attack, spell) + defense
+    return {"stats": st, "mods": mods, "profile": p, "rank": rank_name(renown), "renown": renown, "level": level, "class": c.class_name or "", "species": c.species or "", "hp": hp, "ac": ac, "attack": attack, "spell": spell, "defense": defense, "sustain": sustain, "burst": burst, "control": control, "mobility": mobility, "precision": precision, "riding": riding, "survival": survival, "seed_power": seed_power}
 
-def list_tournaments(guild_id,current):
-    with db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT name FROM tourney.tournaments WHERE guild_id=%s AND status<>'completed' AND name ILIKE %s ORDER BY id DESC LIMIT 25;",(guild_id,f'%{current}%'))
-        return [app_commands.Choice(name=clean(r['name'])[:100],value=clean(r['name'])[:100]) for r in cur.fetchall()]
-def list_events(guild_id,tname,current):
-    with db() as conn, conn.cursor() as cur:
-        if tname:
-            t=get_t(cur,guild_id,tname)
-            if not t: return []
-            cur.execute('SELECT name FROM tourney.events WHERE guild_id=%s AND tournament_id=%s AND name ILIKE %s ORDER BY id DESC LIMIT 25;',(guild_id,t['id'],f'%{current}%'))
-        else: cur.execute('SELECT name FROM tourney.events WHERE guild_id=%s AND name ILIKE %s ORDER BY id DESC LIMIT 25;',(guild_id,f'%{current}%'))
-        return [app_commands.Choice(name=clean(r['name'])[:100],value=clean(r['name'])[:100]) for r in cur.fetchall()]
 
-def chunk(lines,max_len=1000):
-    out=[]; cur=''
-    for l in lines:
-        l=clean(l) or '—'; cand=l if not cur else cur+'\n'+l
-        if len(cand)>max_len:
-            if cur: out.append(cur); cur=l
-            else: out.append(l[:max_len])
-        else: cur=cand
-    if cur: out.append(cur)
-    return out or ['—']
-async def staff(inter):
-    m=inter.user
-    return isinstance(m,discord.Member) and (m.guild_permissions.administrator or m.guild_permissions.manage_guild or m.guild_permissions.manage_events or any(r.id in STAFF_ROLE_IDS for r in m.roles))
+def roll_score(base: int, swing: int = 10) -> int:
+    return int(base) + random.randint(1, swing) + random.randint(1, swing)
+
+
+def simulate_event(event_type: str, competitors: list[tuple[CharacterRef, dict[str, Any]]]) -> tuple[list[dict[str, Any]], list[str]]:
+    results: list[dict[str, Any]] = []
+    lines: list[str] = []
+    label = event_label(event_type)
+
+    if event_type == "duel":
+        for c, cp in competitors:
+            base = max(cp["attack"] + cp["defense"], cp["spell"] + cp["control"]) + cp["sustain"] + cp["burst"]
+            score = roll_score(base, 8)
+            style = "arcane pressure" if cp["spell"] > cp["attack"] else "martial command"
+            lines.append(f"**{clean(c.name)}** enters the dueling ring with {style}, forcing the match into their preferred rhythm.")
+            results.append({"character": c, "cp": cp, "score": score, "note": style})
+    elif event_type == "grand_melee":
+        for c, cp in competitors:
+            chaos = random.randint(2, 20)
+            base = cp["defense"] * 2 + cp["sustain"] * 2 + cp["burst"] + cp["control"] + cp["mobility"]
+            score = base + chaos
+            note = "survives the crush" if cp["defense"] + cp["sustain"] >= cp["burst"] else "strikes with sudden violence"
+            lines.append(f"**{clean(c.name)}** {note} as the melee collapses into shields, spellfire, and dust.")
+            results.append({"character": c, "cp": cp, "score": score, "note": note})
+    elif event_type == "jousting":
+        for c, cp in competitors:
+            base = cp["riding"] * 3 + cp["attack"] + cp["defense"] + mod(cp["stats"]["str"])
+            score = roll_score(base, 9)
+            note = "keeps a brutal seat through impact" if cp["defense"] > cp["mobility"] else "leans into a fast and daring pass"
+            lines.append(f"**{clean(c.name)}** lowers the lance and {note}, drawing a roar from the lists.")
+            results.append({"character": c, "cp": cp, "score": score, "note": note})
+    elif event_type == "archery":
+        for c, cp in competitors:
+            base = cp["precision"] * 4 + cp["control"] // 2 + cp["mobility"]
+            score = roll_score(base, 8)
+            note = "lands a disciplined cluster near the heart" if cp["precision"] >= cp["control"] else "bends uncanny focus into a nearly impossible shot"
+            lines.append(f"**{clean(c.name)}** takes the line, breathes once, and {note}.")
+            results.append({"character": c, "cp": cp, "score": score, "note": note})
+    elif event_type == "horse_racing":
+        for c, cp in competitors:
+            base = cp["riding"] * 3 + cp["mobility"] * 2 + cp["sustain"] + mod(cp["stats"]["con"])
+            score = roll_score(base, 10)
+            note = "paces the mount with veteran patience" if cp["sustain"] > cp["mobility"] else "breaks hard through the dangerous turn"
+            lines.append(f"**{clean(c.name)}** {note}, thunder rolling beneath the hooves.")
+            results.append({"character": c, "cp": cp, "score": score, "note": note})
+    else:  # great_hunt
+        beasts = ["a barbed marsh-stalker", "an iron-tusk boar", "a glass-eyed wyvernling", "a moon-mad dire hart", "a cliffside ashmaw"]
+        beast = random.choice(beasts)
+        for c, cp in competitors:
+            base = cp["survival"] * 3 + max(cp["attack"], cp["spell"]) + cp["sustain"] + cp["precision"]
+            score = roll_score(base, 12)
+            note = "tracks patiently and ends the chase cleanly" if cp["survival"] >= cp["burst"] else "turns a dangerous ambush into a spectacular kill"
+            lines.append(f"**{clean(c.name)}** draws {beast} and {note}.")
+            results.append({"character": c, "cp": cp, "score": score, "note": note})
+
+    # Renown is a tie-breaker/seed flavor only, not a direct score bonus.
+    results.sort(key=lambda r: (-r["score"], -int(r["cp"].get("renown") or 0), clean(r["character"].name)))
+    for i, r in enumerate(results, start=1):
+        r["place"] = i
+    if results:
+        champ = results[0]["character"]
+        if event_type == "grand_melee":
+            lines.append(f"When the safe wards flare and the field is called, **{clean(champ.name)}** is the last competitor standing.")
+        elif event_type == "duel":
+            lines.append(f"The final exchange ends with **{clean(champ.name)}** holding center-ring as the judges call the duel.")
+        elif event_type == "jousting":
+            lines.append(f"Splintered lancewood litters the ground as **{clean(champ.name)}** is named victor of the joust.")
+        elif event_type == "archery":
+            lines.append(f"The final marker is measured twice before **{clean(champ.name)}** is declared master of the range.")
+        elif event_type == "horse_racing":
+            lines.append(f"Dust streams behind the winner as **{clean(champ.name)}** crosses first before the roaring rail.")
+        else:
+            lines.append(f"The hunt-master raises the token of victory for **{clean(champ.name)}**, whose quarry proves the finest of the field.")
+    return results, lines
+
+
+def add_rp(cur, guild_id: int, cid: int, delta: int, champs: int = 0, runners: int = 0, overall: int = 0) -> None:
+    cur.execute("""
+        INSERT INTO tourney.competitor_profiles (guild_id, character_id, renown_points, event_championships, event_runner_ups, overall_championships)
+        VALUES (%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (guild_id, character_id) DO UPDATE SET
+            renown_points=tourney.competitor_profiles.renown_points+EXCLUDED.renown_points,
+            event_championships=tourney.competitor_profiles.event_championships+EXCLUDED.event_championships,
+            event_runner_ups=tourney.competitor_profiles.event_runner_ups+EXCLUDED.event_runner_ups,
+            overall_championships=tourney.competitor_profiles.overall_championships+EXCLUDED.overall_championships,
+            updated_at=NOW();
+    """, (guild_id, cid, int(delta), int(champs), int(runners), int(overall)))
+
+
+def econ_pay(cur, guild_id: int, cid: int, actor: Optional[int], amount: int, action: str, details: dict[str, Any]) -> None:
+    amount = int(amount or 0)
+    if amount <= 0:
+        return
+    cur.execute("""
+        INSERT INTO econ.balances (guild_id, character_id, balance_embers, updated_at)
+        VALUES (%s,%s,%s,NOW())
+        ON CONFLICT (guild_id, character_id) DO UPDATE SET balance_embers=econ.balances.balance_embers+EXCLUDED.balance_embers, updated_at=NOW();
+    """, (guild_id, cid, amount))
+    cur.execute("""
+        INSERT INTO econ.transactions (guild_id, character_id, actor_user_id, action, amount_embers, details_json)
+        VALUES (%s,%s,%s,%s,%s,%s::jsonb);
+    """, (guild_id, cid, actor, action, amount, json.dumps(details)))
+    cur.execute("INSERT INTO public.alaris_character_refresh_queue (guild_id, character_id, reason) VALUES (%s,%s,'tournament_payout');", (guild_id, cid))
+
+
+async def is_staff(interaction: discord.Interaction) -> bool:
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    m = interaction.user
+    if m.guild_permissions.administrator or m.guild_permissions.manage_guild or m.guild_permissions.manage_events:
+        return True
+    return any(r.id in STAFF_ROLE_IDS for r in m.roles)
+
+
 def staff_only():
-    async def pred(inter):
-        if await staff(inter): return True
-        await inter.response.send_message('You do not have permission to use this tournament staff command.',ephemeral=True); return False
+    async def pred(interaction: discord.Interaction) -> bool:
+        if await is_staff(interaction):
+            return True
+        if interaction.response.is_done():
+            await interaction.followup.send("You do not have permission to use this tournament staff command.", ephemeral=True)
+        else:
+            await interaction.response.send_message("You do not have permission to use this tournament staff command.", ephemeral=True)
+        return False
     return app_commands.check(pred)
-async def char_ac(inter,current): return await run_db(search_chars,int(inter.guild_id or GUILD_ID),current or '',None)
-async def own_char_ac(inter,current): return await run_db(search_chars,int(inter.guild_id or GUILD_ID),current or '',None if await staff(inter) else int(inter.user.id))
-async def tourn_ac(inter,current): return await run_db(list_tournaments,int(inter.guild_id or GUILD_ID),current or '')
-async def event_ac(inter,current):
-    t=getattr(getattr(inter,'namespace',None),'tournament',None)
-    return await run_db(list_events,int(inter.guild_id or GUILD_ID),t,current or '')
-async def send_chan(cid,embed=None,content=None):
-    if not cid: return None
-    ch=client.get_channel(int(cid)) or await client.fetch_channel(int(cid))
-    if isinstance(ch,(discord.TextChannel,discord.Thread)): return await ch.send(content=content,embed=embed,allowed_mentions=discord.AllowedMentions.none())
-async def public_post(inter,embed): return await send_chan(PUBLIC_CHANNEL_ID or inter.channel_id,embed=embed)
 
-@tree.command(name='tourney-profile-view',description="View a character's derived tournament profile.",guild=discord.Object(id=GUILD_ID))
-@app_commands.autocomplete(character=char_ac)
-async def profile_view(inter,character:str):
-    await inter.response.defer(ephemeral=True); gid=int(inter.guild_id or GUILD_ID); c=await run_db(fetch_char,gid,character)
-    if not c: return await inter.followup.send('Character not found.',ephemeral=True)
-    sk=await run_db(skills,gid,c.character_id); p=await run_db(profile,gid,c.character_id); st=sk['_stats']
-    e=discord.Embed(title=f'{clean(c.name)} — Tournament Profile',color=discord.Color.gold(),description=f"**Kingdom:** {clean(c.kingdom or 'Unassigned')}\n**Rank:** {sk['_rank']} (+{sk['_bonus']})\n**Renown Points:** {sk['_rp']}")
-    e.add_field(name='Alaris Stats',value=f"STR {st['str']} | DEX {st['dex']} | CON {st['con']} | INT {st['int']} | WIS {st['wis']} | CHA {st['cha']}",inline=False)
-    e.add_field(name='Derived Skills',value=f"Riding **{sk['riding']}** | Weapon **{sk['weapon']}** | Archery **{sk['archery']}**\nDuel **{sk['duel']}** | Stamina **{sk['stamina']}** | Composure **{sk['composure']}**",inline=False)
-    e.add_field(name='Career',value=f"Events Entered: **{p.get('events_entered',0)}**\nMatch/Heat Wins: **{p.get('match_wins',0)}**\nEvent Championships: **{p.get('event_championships',0)}**\nOverall Championships: **{p.get('overall_championships',0)}**",inline=False)
-    await inter.followup.send(embed=e,ephemeral=True)
 
-@tree.command(name='tourney-create',description='Staff: create a tournament.',guild=discord.Object(id=GUILD_ID))
+async def char_auto(interaction: discord.Interaction, current: str):
+    return await run_db(search_chars, int(interaction.guild_id or GUILD_ID), current or "", None)
+
+
+async def owned_char_auto(interaction: discord.Interaction, current: str):
+    owner = None if await is_staff(interaction) else int(interaction.user.id)
+    return await run_db(search_chars, int(interaction.guild_id or GUILD_ID), current or "", owner)
+
+
+async def tourney_auto(interaction: discord.Interaction, current: str):
+    return await run_db(search_tourneys, int(interaction.guild_id or GUILD_ID), current or "")
+
+
+async def event_auto(interaction: discord.Interaction, current: str):
+    tname = None
+    try:
+        tname = getattr(interaction.namespace, "tournament", None)
+    except Exception:
+        pass
+    return await run_db(search_event_names, int(interaction.guild_id or GUILD_ID), tname, current or "")
+
+
+async def send_channel(channel_id: Optional[int], *, content: Optional[str] = None, embed: Optional[discord.Embed] = None):
+    if not channel_id:
+        return None
+    ch = client.get_channel(int(channel_id))
+    if ch is None:
+        try:
+            ch = await client.fetch_channel(int(channel_id))
+        except Exception:
+            return None
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return None
+    try:
+        return await ch.send(content=content, embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as exc:
+        LOG.warning("Could not send to channel %s: %s", channel_id, exc)
+        return None
+
+
+async def public_post(interaction: discord.Interaction, embed: discord.Embed):
+    return await send_channel(PUBLIC_CHANNEL_ID or interaction.channel_id, embed=embed)
+
+
+async def log_action(action: str, lines: list[str]):
+    await send_channel(LOG_CHANNEL_ID, content=(f"**TOURNEY LOG:** `{action}`\n" + "\n".join(lines))[:1900])
+
+
+def create_tournament(guild_id: int, name: str, kingdom: str, notes: Optional[str], actor: int) -> dict[str, Any]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO tourney.tournaments (guild_id,name,host_kingdom,status,notes,created_by_user_id)
+                VALUES (%s,%s,%s,'draft',%s,%s)
+                ON CONFLICT (guild_id,name) DO UPDATE SET host_kingdom=EXCLUDED.host_kingdom, notes=EXCLUDED.notes, updated_at=NOW()
+                RETURNING *;
+            """, (guild_id, name.strip(), kingdom, notes, actor))
+            row = dict(cur.fetchone())
+        conn.commit()
+    return row
+
+
+def add_event(guild_id: int, tournament: str, name: str, etype: str, max_entrants: Optional[int]) -> dict[str, Any]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament))
+            t = cur.fetchone()
+            if not t:
+                return {"ok": False, "reason": "tournament_not_found"}
+            cur.execute("""
+                INSERT INTO tourney.events (guild_id,tournament_id,name,event_type,status,max_entrants,format_type)
+                VALUES (%s,%s,%s,%s,'draft',%s,'instant_sim')
+                ON CONFLICT (guild_id,tournament_id,name) DO UPDATE SET event_type=EXCLUDED.event_type, max_entrants=EXCLUDED.max_entrants, format_type='instant_sim', updated_at=NOW()
+                RETURNING *;
+            """, (guild_id, t["id"], name.strip(), etype, max_entrants))
+            e = dict(cur.fetchone())
+        conn.commit()
+    return {"ok": True, "tournament": dict(t), "event": e}
+
+
+def tournament_status(guild_id: int, tournament: str) -> Optional[dict[str, Any]]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament))
+            t = cur.fetchone()
+            if not t:
+                return None
+            cur.execute("SELECT * FROM tourney.events WHERE guild_id=%s AND tournament_id=%s ORDER BY id;", (guild_id, t["id"]))
+            events = [dict(r) for r in cur.fetchall()]
+            metrics = {}
+            for e in events:
+                cur.execute("SELECT COUNT(*) AS n FROM tourney.entries WHERE guild_id=%s AND event_id=%s AND registration_status='registered';", (guild_id, e["id"]))
+                metrics[int(e["id"])] = int(cur.fetchone()["n"] or 0)
+    return {"tournament": dict(t), "events": events, "metrics": metrics}
+
+
+def register(guild_id: int, tournament: str, event: str, character: str, actor: int, staff: bool) -> dict[str, Any]:
+    c = character_by_name(guild_id, character)
+    if not c:
+        return {"ok": False, "reason": "character_not_found"}
+    if not staff and c.user_id != actor:
+        return {"ok": False, "reason": "not_owner"}
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament))
+            t = cur.fetchone()
+            if not t:
+                return {"ok": False, "reason": "tournament_not_found"}
+            cur.execute("SELECT * FROM tourney.events WHERE guild_id=%s AND tournament_id=%s AND name=%s LIMIT 1;", (guild_id, t["id"], event))
+            e = cur.fetchone()
+            if not e:
+                return {"ok": False, "reason": "event_not_found"}
+            if e["status"] != "draft":
+                return {"ok": False, "reason": "registration_closed"}
+            cur.execute("SELECT COUNT(*) AS n FROM tourney.entries WHERE guild_id=%s AND event_id=%s AND registration_status='registered';", (guild_id, e["id"]))
+            if e.get("max_entrants") and int(cur.fetchone()["n"] or 0) >= int(e["max_entrants"]):
+                return {"ok": False, "reason": "event_full"}
+            cur.execute("""
+                INSERT INTO tourney.entries (guild_id,tournament_id,event_id,character_id,user_id,registration_status)
+                VALUES (%s,%s,%s,%s,%s,'registered')
+                ON CONFLICT (guild_id,event_id,character_id) DO UPDATE SET registration_status='registered', updated_at=NOW();
+            """, (guild_id, t["id"], e["id"], c.character_id, c.user_id))
+            cur.execute("""
+                INSERT INTO tourney.competitor_profiles (guild_id,character_id,events_entered)
+                VALUES (%s,%s,1)
+                ON CONFLICT (guild_id,character_id) DO UPDATE SET events_entered=tourney.competitor_profiles.events_entered+1, updated_at=NOW();
+            """, (guild_id, c.character_id))
+        conn.commit()
+    return {"ok": True, "character": c}
+
+
+def withdraw(guild_id: int, tournament: str, event: str, character: str, actor: int, staff: bool) -> dict[str, Any]:
+    c = character_by_name(guild_id, character)
+    if not c:
+        return {"ok": False, "reason": "character_not_found"}
+    if not staff and c.user_id != actor:
+        return {"ok": False, "reason": "not_owner"}
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament))
+            t = cur.fetchone()
+            if not t:
+                return {"ok": False, "reason": "tournament_not_found"}
+            cur.execute("SELECT * FROM tourney.events WHERE guild_id=%s AND tournament_id=%s AND name=%s LIMIT 1;", (guild_id, t["id"], event))
+            e = cur.fetchone()
+            if not e:
+                return {"ok": False, "reason": "event_not_found"}
+            if e["status"] != "draft":
+                return {"ok": False, "reason": "registration_closed"}
+            cur.execute("""
+                UPDATE tourney.entries SET registration_status='withdrawn', updated_at=NOW()
+                WHERE guild_id=%s AND event_id=%s AND character_id=%s AND registration_status='registered';
+            """, (guild_id, e["id"], c.character_id))
+            n = cur.rowcount
+        conn.commit()
+    return {"ok": bool(n), "reason": "not_registered" if not n else "", "character": c}
+
+
+def run_event(guild_id: int, tournament: str, event: str) -> dict[str, Any]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament))
+            t = cur.fetchone()
+            if not t:
+                return {"ok": False, "reason": "tournament_not_found"}
+            cur.execute("SELECT * FROM tourney.events WHERE guild_id=%s AND tournament_id=%s AND name=%s LIMIT 1;", (guild_id, t["id"], event))
+            e = cur.fetchone()
+            if not e:
+                return {"ok": False, "reason": "event_not_found"}
+            if e["status"] == "completed":
+                return {"ok": False, "reason": "already_completed"}
+            cur.execute("""
+                SELECT en.id AS entry_id, c.character_id, c.user_id, c.name, c.kingdom, c.species, c.class_name, COALESCE(c.level,1) AS level,
+                       COALESCE(p.renown_points,0) AS renown_points
+                FROM tourney.entries en
+                JOIN public.characters c ON c.guild_id=en.guild_id AND c.character_id=en.character_id
+                LEFT JOIN tourney.competitor_profiles p ON p.guild_id=en.guild_id AND p.character_id=en.character_id
+                WHERE en.guild_id=%s AND en.event_id=%s AND en.registration_status='registered'
+                ORDER BY COALESCE(p.renown_points,0) DESC, c.name ASC;
+            """, (guild_id, e["id"]))
+            rows = cur.fetchall()
+            if len(rows) < 2:
+                return {"ok": False, "reason": "not_enough_entrants"}
+            competitors: list[tuple[CharacterRef, dict[str, Any]]] = []
+            for r in rows:
+                c = CharacterRef(guild_id, int(r["character_id"]), int(r["user_id"]), str(r["name"]), r.get("kingdom"), r.get("species"), r.get("class_name"), int(r.get("level") or 1))
+                competitors.append((c, combat_profile(guild_id, c)))
+            results, lines = simulate_event(str(e["event_type"]), competitors)
+            for r in results:
+                c = r["character"]
+                place = int(r["place"])
+                points = EVENT_SCORE.get(place, 0)
+                cur.execute("""
+                    INSERT INTO tourney.event_results (guild_id,tournament_id,event_id,character_id,place,score,details_json,narrative)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                    ON CONFLICT (guild_id,event_id,character_id) DO UPDATE SET place=EXCLUDED.place, score=EXCLUDED.score, details_json=EXCLUDED.details_json, narrative=EXCLUDED.narrative;
+                """, (guild_id, t["id"], e["id"], c.character_id, place, int(r["score"]), json.dumps({"note": r.get("note"), "class": r["cp"].get("class"), "level": r["cp"].get("level"), "renown": r["cp"].get("renown")}), r.get("note")))
+                cur.execute("UPDATE tourney.entries SET tournament_score=tournament_score+%s, updated_at=NOW() WHERE guild_id=%s AND event_id=%s AND character_id=%s;", (points, guild_id, e["id"], c.character_id))
+            cur.execute("UPDATE tourney.events SET status='ready_to_finalize', updated_at=NOW() WHERE id=%s;", (e["id"],))
+        conn.commit()
+    return {"ok": True, "tournament": dict(t), "event": dict(e), "results": results, "lines": lines}
+
+
+def finalize_event_db(guild_id: int, tournament: str, event: str, actor: int) -> dict[str, Any]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament))
+            t = cur.fetchone()
+            if not t:
+                return {"ok": False, "reason": "tournament_not_found"}
+            cur.execute("SELECT * FROM tourney.events WHERE guild_id=%s AND tournament_id=%s AND name=%s LIMIT 1;", (guild_id, t["id"], event))
+            e = cur.fetchone()
+            if not e:
+                return {"ok": False, "reason": "event_not_found"}
+            if e["status"] == "completed":
+                return {"ok": False, "reason": "already_completed"}
+            if e["status"] != "ready_to_finalize":
+                return {"ok": False, "reason": "not_ready"}
+            cur.execute("""
+                SELECT er.*, c.name FROM tourney.event_results er
+                JOIN public.characters c ON c.guild_id=er.guild_id AND c.character_id=er.character_id
+                WHERE er.guild_id=%s AND er.event_id=%s ORDER BY er.place ASC;
+            """, (guild_id, e["id"]))
+            rows = [dict(r) for r in cur.fetchall()]
+            if not rows:
+                return {"ok": False, "reason": "no_results"}
+            total_pay = 0
+            for r in rows:
+                cid = int(r["character_id"]); place = int(r["place"]); points = EVENT_SCORE.get(place, 0)
+                rp = RP_EVENT_WIN if place == 1 else RP_RUNNER_UP if place == 2 else 0
+                champs = 1 if place == 1 else 0; runners = 1 if place == 2 else 0
+                pay = EVENT_CHAMPION_PAY if place == 1 else EVENT_RUNNER_PAY if place == 2 else 0
+                add_rp(cur, guild_id, cid, rp, champs, runners)
+                econ_pay(cur, guild_id, cid, actor, pay, "tournament_event_payout", {"tournament": tournament, "event": event, "place": place})
+                total_pay += pay
+                cur.execute("""
+                    INSERT INTO tourney.awards (guild_id,tournament_id,event_id,character_id,award_code,award_name,points_awarded,renown_awarded,payout_embers)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                """, (guild_id, t["id"], e["id"], cid, "event_place", f"{event_label(e['event_type'])} Place {place}", points, rp, pay))
+                cur.execute("INSERT INTO public.alaris_character_refresh_queue (guild_id,character_id,reason) VALUES (%s,%s,'tournament_event_finalized');", (guild_id, cid))
+            cur.execute("UPDATE tourney.events SET status='completed', updated_at=NOW() WHERE id=%s;", (e["id"],))
+            cur.execute("SELECT COUNT(*) AS n FROM tourney.events WHERE guild_id=%s AND tournament_id=%s AND status <> 'completed';", (guild_id, t["id"]))
+            open_n = int(cur.fetchone()["n"] or 0)
+            cur.execute("UPDATE tourney.tournaments SET status=%s, updated_at=NOW() WHERE id=%s;", ("ready_to_finalize" if open_n == 0 else "active", t["id"]))
+        conn.commit()
+    return {"ok": True, "tournament": dict(t), "event": dict(e), "rows": rows, "total_pay": total_pay}
+
+
+def finalize_tournament_db(guild_id: int, tournament: str, actor: int) -> dict[str, Any]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament))
+            t = cur.fetchone()
+            if not t:
+                return {"ok": False, "reason": "tournament_not_found"}
+            cur.execute("SELECT COUNT(*) AS n FROM tourney.events WHERE guild_id=%s AND tournament_id=%s AND status <> 'completed';", (guild_id, t["id"]))
+            if int(cur.fetchone()["n"] or 0) > 0:
+                return {"ok": False, "reason": "events_not_completed"}
+            cur.execute("""
+                SELECT en.character_id, c.name, COALESCE(SUM(en.tournament_score),0) AS score
+                FROM tourney.entries en JOIN public.characters c ON c.guild_id=en.guild_id AND c.character_id=en.character_id
+                WHERE en.guild_id=%s AND en.tournament_id=%s AND en.registration_status='registered'
+                GROUP BY en.character_id,c.name ORDER BY score DESC, c.name ASC;
+            """, (guild_id, t["id"]))
+            rows = [dict(r) for r in cur.fetchall()]
+            if not rows:
+                return {"ok": False, "reason": "no_entries"}
+            champ = rows[0]
+            add_rp(cur, guild_id, int(champ["character_id"]), RP_OVERALL_CHAMPION, overall=1)
+            econ_pay(cur, guild_id, int(champ["character_id"]), actor, OVERALL_CHAMPION_PAY, "tournament_overall_champion_payout", {"tournament": tournament})
+            cut = int(round(OVERALL_CHAMPION_PAY * 0.10)) if OVERALL_CHAMPION_PAY and t.get("host_kingdom") else 0
+            if cut:
+                cur.execute("""
+                    INSERT INTO econ.kingdoms (guild_id,kingdom,treasury_embers,updated_at)
+                    VALUES (%s,%s,%s,NOW())
+                    ON CONFLICT (guild_id,kingdom) DO UPDATE SET treasury_embers=econ.kingdoms.treasury_embers+EXCLUDED.treasury_embers, updated_at=NOW();
+                """, (guild_id, t["host_kingdom"], cut))
+            cur.execute("""
+                INSERT INTO tourney.awards (guild_id,tournament_id,event_id,character_id,award_code,award_name,points_awarded,renown_awarded,payout_embers)
+                VALUES (%s,%s,NULL,%s,'overall_champion',%s,%s,%s,%s);
+            """, (guild_id, t["id"], int(champ["character_id"]), f"Overall Champion of {clean(tournament)}", int(champ["score"] or 0), RP_OVERALL_CHAMPION, OVERALL_CHAMPION_PAY))
+            cur.execute("UPDATE tourney.tournaments SET status='completed', updated_at=NOW() WHERE id=%s;", (t["id"],))
+        conn.commit()
+    return {"ok": True, "tournament": dict(t), "standings": rows, "champion": champ, "payout": OVERALL_CHAMPION_PAY, "cut": cut}
+
+
+@tree.command(name="tourney-profile-view", description="View a character's tournament prestige profile.", guild=discord.Object(id=GUILD_ID))
+@app_commands.autocomplete(character=char_auto)
+async def profile_view(interaction: discord.Interaction, character: str):
+    await interaction.response.defer(ephemeral=True)
+    c = await run_db(character_by_name, int(interaction.guild_id or GUILD_ID), character)
+    if not c:
+        await interaction.followup.send("Character not found.", ephemeral=True); return
+    cp = await run_db(combat_profile, int(interaction.guild_id or GUILD_ID), c)
+    st = cp["stats"]
+    emb = discord.Embed(title=f"{clean(c.name)} — Tournament Profile", color=discord.Color.gold())
+    emb.description = f"**Rank:** {cp['rank']}\n**Renown:** {cp['renown']} RP\n**Class:** {clean(c.class_name or '—')} | **Level:** {c.level}\n**Kingdom:** {clean(c.kingdom or 'Unassigned')}"
+    emb.add_field(name="Alaris Stats", value=f"STR {st['str']} | DEX {st['dex']} | CON {st['con']} | INT {st['int']} | WIS {st['wis']} | CHA {st['cha']}", inline=False)
+    emb.add_field(name="Simulation Profile", value=f"HP {cp['hp']} | AC {cp['ac']} | Attack {cp['attack']} | Spell {cp['spell']}\nDefense {cp['defense']} | Sustain {cp['sustain']} | Burst {cp['burst']} | Control {cp['control']}\nRiding {cp['riding']} | Precision {cp['precision']} | Survival {cp['survival']}", inline=False)
+    emb.set_footer(text="Renown affects seeding and prestige only, not direct combat power.")
+    await interaction.followup.send(embed=emb, ephemeral=True)
+
+
+@tree.command(name="tourney-create", description="Staff: create a tournament.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
 @app_commands.choices(host_kingdom=KINGDOM_CHOICES)
-async def tourney_create(inter,name:str,host_kingdom:app_commands.Choice[str],notes:Optional[str]=None):
-    await inter.response.defer(ephemeral=True); gid=int(inter.guild_id or GUILD_ID)
-    def f():
-        with db() as conn, conn.cursor() as cur:
-            cur.execute("INSERT INTO tourney.tournaments(guild_id,name,host_kingdom,status,notes,created_by_user_id) VALUES(%s,%s,%s,'draft',%s,%s) ON CONFLICT(guild_id,name) DO UPDATE SET host_kingdom=EXCLUDED.host_kingdom,notes=EXCLUDED.notes,updated_at=NOW() RETURNING *;",(gid,name.strip(),host_kingdom.value,notes,inter.user.id)); r=dict(cur.fetchone()); conn.commit(); return r
-    r=await run_db(f); await inter.followup.send(f"Created **{clean(r['name'])}** hosted by **{clean(r['host_kingdom'])}**.",ephemeral=True)
+async def tourney_create(interaction: discord.Interaction, name: str, host_kingdom: app_commands.Choice[str], notes: Optional[str] = None):
+    await interaction.response.defer(ephemeral=True)
+    row = await run_db(create_tournament, int(interaction.guild_id or GUILD_ID), name, host_kingdom.value, notes, interaction.user.id)
+    await interaction.followup.send(f"Created **{clean(row['name'])}** hosted by **{clean(row['host_kingdom'])}**.", ephemeral=True)
 
-@tree.command(name='tourney-event-add',description='Staff: add an event.',guild=discord.Object(id=GUILD_ID))
+
+@tree.command(name="tourney-event-add", description="Staff: add one of the six event types to a tournament.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
-@app_commands.autocomplete(tournament=tourn_ac)
+@app_commands.autocomplete(tournament=tourney_auto)
 @app_commands.choices(event_type=EVENT_CHOICES)
-async def event_add(inter,tournament:str,name:str,event_type:app_commands.Choice[str],max_entrants:Optional[int]=None):
-    await inter.response.defer(ephemeral=True); gid=int(inter.guild_id or GUILD_ID); et=event_type.value; fmt=EVENT_TYPES[et][1]
-    def f():
-        with db() as conn, conn.cursor() as cur:
-            t=get_t(cur,gid,tournament)
-            if not t: return None
-            cur.execute("INSERT INTO tourney.events(guild_id,tournament_id,name,event_type,format_type,status,max_entrants) VALUES(%s,%s,%s,%s,%s,'draft',%s) ON CONFLICT(guild_id,tournament_id,name) DO UPDATE SET event_type=EXCLUDED.event_type,format_type=EXCLUDED.format_type,max_entrants=EXCLUDED.max_entrants,updated_at=NOW() RETURNING *;",(gid,t['id'],name.strip(),et,fmt,max_entrants)); e=dict(cur.fetchone()); conn.commit(); return e
-    e=await run_db(f)
-    if not e: return await inter.followup.send('Tournament not found.',ephemeral=True)
-    await inter.followup.send(f"Added **{clean(e['name'])}** as **{EVENT_TYPES[e['event_type']][0]}**.",ephemeral=True)
+async def tourney_event_add(interaction: discord.Interaction, tournament: str, name: str, event_type: app_commands.Choice[str], max_entrants: Optional[int] = None):
+    await interaction.response.defer(ephemeral=True)
+    res = await run_db(add_event, int(interaction.guild_id or GUILD_ID), tournament, name, event_type.value, max_entrants)
+    if not res.get("ok"):
+        await interaction.followup.send("Tournament not found.", ephemeral=True); return
+    await interaction.followup.send(f"Added **{clean(name)}** as **{event_label(event_type.value)}**.", ephemeral=True)
 
-@tree.command(name='tourney-register',description='Register a character for an event.',guild=discord.Object(id=GUILD_ID))
-@app_commands.autocomplete(tournament=tourn_ac,event=event_ac,character=own_char_ac)
-async def register(inter,tournament:str,event:str,character:str):
-    await inter.response.defer(ephemeral=True); gid=int(inter.guild_id or GUILD_ID); is_staff=await staff(inter)
-    def f():
-        with db() as conn, conn.cursor() as cur:
-            t=get_t(cur,gid,tournament); 
-            if not t: return 'Tournament not found.'
-            e=get_e(cur,gid,t['id'],event)
-            if not e: return 'Event not found.'
-            if e['status'] in ('completed','ready_to_finalize') or int(e['round_number'] or 0)>0: return 'Registration is closed for that event.'
-            c=fetch_char(gid,character)
-            if not c: return 'Character not found.'
-            if not is_staff and c.user_id!=inter.user.id: return 'You may only register characters you own.'
-            cur.execute("SELECT COUNT(*) AS n FROM tourney.entries WHERE guild_id=%s AND event_id=%s AND registration_status<>'withdrawn';",(gid,e['id']))
-            if e['max_entrants'] and int(cur.fetchone()['n'] or 0)>=int(e['max_entrants']): return 'That event is full.'
-            cur.execute("INSERT INTO tourney.entries(guild_id,tournament_id,event_id,character_id,user_id,registration_status) VALUES(%s,%s,%s,%s,%s,'registered') ON CONFLICT(guild_id,event_id,character_id) DO UPDATE SET registration_status='registered',updated_at=NOW();",(gid,t['id'],e['id'],c.character_id,c.user_id))
-            cur.execute('INSERT INTO tourney.competitor_profiles(guild_id,character_id,events_entered) VALUES(%s,%s,1) ON CONFLICT(guild_id,character_id) DO UPDATE SET events_entered=tourney.competitor_profiles.events_entered+1,updated_at=NOW();',(gid,c.character_id))
-            conn.commit(); return f'Registered **{clean(c.name)}** for **{clean(event)}**.'
-    await inter.followup.send(await run_db(f),ephemeral=True)
 
-@tree.command(name='tourney-withdraw',description='Withdraw a character before an event starts.',guild=discord.Object(id=GUILD_ID))
-@app_commands.autocomplete(tournament=tourn_ac,event=event_ac,character=own_char_ac)
-async def withdraw(inter,tournament:str,event:str,character:str):
-    await inter.response.defer(ephemeral=True); gid=int(inter.guild_id or GUILD_ID); is_staff=await staff(inter)
-    def f():
-        with db() as conn, conn.cursor() as cur:
-            t=get_t(cur,gid,tournament); 
-            if not t: return 'Tournament not found.'
-            e=get_e(cur,gid,t['id'],event)
-            if not e: return 'Event not found.'
-            if e['status'] in ('completed','ready_to_finalize') or int(e['round_number'] or 0)>0: return 'Registration is closed for that event.'
-            c=fetch_char(gid,character)
-            if not c: return 'Character not found.'
-            if not is_staff and c.user_id!=inter.user.id: return 'You may only withdraw characters you own.'
-            cur.execute("UPDATE tourney.entries SET registration_status='withdrawn',updated_at=NOW() WHERE guild_id=%s AND event_id=%s AND character_id=%s AND registration_status<>'withdrawn';",(gid,e['id'],c.character_id)); n=cur.rowcount; conn.commit(); return f'Withdrew **{clean(c.name)}** from **{clean(event)}**.' if n else 'That character is not registered for that event.'
-    await inter.followup.send(await run_db(f),ephemeral=True)
+@tree.command(name="tourney-register", description="Register one of your characters for a tournament event.", guild=discord.Object(id=GUILD_ID))
+@app_commands.autocomplete(tournament=tourney_auto, event=event_auto, character=owned_char_auto)
+async def tourney_register(interaction: discord.Interaction, tournament: str, event: str, character: str):
+    await interaction.response.defer(ephemeral=True)
+    res = await run_db(register, int(interaction.guild_id or GUILD_ID), tournament, event, character, interaction.user.id, await is_staff(interaction))
+    if not res.get("ok"):
+        await interaction.followup.send(f"Could not register: `{clean(res.get('reason'))}`.", ephemeral=True); return
+    await interaction.followup.send(f"Registered **{clean(res['character'].name)}** for **{clean(event)}**.", ephemeral=True)
 
-def init_h2h(cur,gid,t,e):
-    cur.execute('SELECT COUNT(*) AS n FROM tourney.matches WHERE guild_id=%s AND event_id=%s;',(gid,e['id']))
-    if int(cur.fetchone()['n'] or 0)>0: return True,''
-    cur.execute("SELECT en.id AS entry_id,en.character_id,en.user_id,c.name FROM tourney.entries en JOIN public.characters c ON c.guild_id=en.guild_id AND c.character_id=en.character_id WHERE en.guild_id=%s AND en.event_id=%s AND en.registration_status='registered' ORDER BY c.name;",(gid,e['id']))
-    rows=[dict(r) for r in cur.fetchall()]
-    if len(rows)<2: return False,'not_enough_entrants'
-    scored=[]
-    for r in rows:
-        sk=skills(gid,int(r['character_id'])); r['score']=seed_score(e['event_type'],sk); scored.append(r)
-    scored.sort(key=lambda x:(-x['score'],clean(x['name'])))
-    for i,r in enumerate(scored,1): cur.execute('UPDATE tourney.entries SET seed=%s WHERE id=%s;',(i,r['entry_id']))
-    order=1; work=list(scored)
-    while len(work)>1:
-        a=work.pop(0); idx=len(work)-1
-        for j in range(len(work)-1,-1,-1):
-            if work[j]['user_id']!=a['user_id']: idx=j; break
-        b=work.pop(idx)
-        cur.execute("INSERT INTO tourney.matches(guild_id,tournament_id,event_id,round_number,match_order,status,match_type) VALUES(%s,%s,%s,1,%s,'pending','head_to_head') RETURNING id;",(gid,t['id'],e['id'],order)); mid=cur.fetchone()['id']
-        cur.execute('INSERT INTO tourney.match_participants(guild_id,match_id,entry_id,character_id,slot_number) VALUES(%s,%s,%s,%s,1);',(gid,mid,a['entry_id'],a['character_id']))
-        cur.execute('INSERT INTO tourney.match_participants(guild_id,match_id,entry_id,character_id,slot_number) VALUES(%s,%s,%s,%s,2);',(gid,mid,b['entry_id'],b['character_id']))
-        order+=1
-    if work:
-        a=work[0]; cur.execute("INSERT INTO tourney.matches(guild_id,tournament_id,event_id,round_number,match_order,status,match_type,winner_character_id,narrative_summary,completed_at) VALUES(%s,%s,%s,1,%s,'completed','bye',%s,'Automatic bye advancement.',NOW()) RETURNING id;",(gid,t['id'],e['id'],order,a['character_id'])); mid=cur.fetchone()['id']; cur.execute('INSERT INTO tourney.match_participants(guild_id,match_id,entry_id,character_id,slot_number,final_position) VALUES(%s,%s,%s,%s,1,1);',(gid,mid,a['entry_id'],a['character_id'])); cur.execute("UPDATE tourney.entries SET registration_status='advanced' WHERE id=%s;",(a['entry_id'],))
-    cur.execute("UPDATE tourney.events SET status='active',round_number=1,updated_at=NOW() WHERE id=%s;",(e['id'],)); return True,''
 
-def auto_advance(cur,gid,t,e):
-    notes=[]
-    while True:
-        cur.execute('SELECT COALESCE(MAX(round_number),0) AS r FROM tourney.matches WHERE guild_id=%s AND event_id=%s;',(gid,e['id'])); rno=int(cur.fetchone()['r'] or 0)
-        cur.execute("SELECT COUNT(*) FILTER(WHERE match_type='head_to_head') AS total, COUNT(*) FILTER(WHERE match_type='head_to_head' AND status='completed') AS done FROM tourney.matches WHERE guild_id=%s AND event_id=%s AND round_number=%s;",(gid,e['id'],rno)); st=cur.fetchone()
-        if int(st['total'] or 0)==0 or int(st['total'] or 0)!=int(st['done'] or 0): return notes
-        cur.execute('SELECT winner_character_id FROM tourney.matches WHERE guild_id=%s AND event_id=%s AND round_number=%s AND winner_character_id IS NOT NULL ORDER BY match_order,id;',(gid,e['id'],rno)); winners=[int(x['winner_character_id']) for x in cur.fetchall()]
-        if len(winners)<=1:
-            cur.execute("UPDATE tourney.events SET status='ready_to_finalize',updated_at=NOW() WHERE id=%s;",(e['id'],)); notes.append('Event is ready to finalize.'); return notes
-        cur.execute('SELECT COUNT(*) AS n FROM tourney.matches WHERE guild_id=%s AND event_id=%s AND round_number=%s;',(gid,e['id'],rno+1))
-        if int(cur.fetchone()['n'] or 0)>0: return notes
-        entries=[]
-        for cid in winners:
-            cur.execute('SELECT id AS entry_id,character_id,user_id FROM tourney.entries WHERE guild_id=%s AND event_id=%s AND character_id=%s LIMIT 1;',(gid,e['id'],cid)); rr=cur.fetchone()
-            if rr: entries.append(dict(rr))
-        order=1; work=entries
-        while len(work)>1:
-            a=work.pop(0); b=work.pop(-1); cur.execute("INSERT INTO tourney.matches(guild_id,tournament_id,event_id,round_number,match_order,status,match_type) VALUES(%s,%s,%s,%s,%s,'pending','head_to_head') RETURNING id;",(gid,t['id'],e['id'],rno+1,order)); mid=cur.fetchone()['id']; cur.execute('INSERT INTO tourney.match_participants(guild_id,match_id,entry_id,character_id,slot_number) VALUES(%s,%s,%s,%s,1);',(gid,mid,a['entry_id'],a['character_id'])); cur.execute('INSERT INTO tourney.match_participants(guild_id,match_id,entry_id,character_id,slot_number) VALUES(%s,%s,%s,%s,2);',(gid,mid,b['entry_id'],b['character_id'])); order+=1
-        cur.execute('UPDATE tourney.events SET round_number=%s,status=%s WHERE id=%s;',(rno+1,'active',e['id'])); notes.append(f'Round {rno+1} generated automatically.')
+@tree.command(name="tourney-withdraw", description="Withdraw one of your characters before an event is run.", guild=discord.Object(id=GUILD_ID))
+@app_commands.autocomplete(tournament=tourney_auto, event=event_auto, character=owned_char_auto)
+async def tourney_withdraw(interaction: discord.Interaction, tournament: str, event: str, character: str):
+    await interaction.response.defer(ephemeral=True)
+    res = await run_db(withdraw, int(interaction.guild_id or GUILD_ID), tournament, event, character, interaction.user.id, await is_staff(interaction))
+    if not res.get("ok"):
+        await interaction.followup.send(f"Could not withdraw: `{clean(res.get('reason'))}`.", ephemeral=True); return
+    await interaction.followup.send(f"Withdrew **{clean(res['character'].name)}** from **{clean(event)}**.", ephemeral=True)
 
-def run_h2h(gid,tname,ename):
-    with db() as conn, conn.cursor() as cur:
-        t=get_t(cur,gid,tname); 
-        if not t: return {'ok':False,'reason':'tournament_not_found'}
-        e=get_e(cur,gid,t['id'],ename)
-        if not e: return {'ok':False,'reason':'event_not_found'}
-        ok,reason=init_h2h(cur,gid,t,e)
-        if not ok: conn.rollback(); return {'ok':False,'reason':reason}
-        cur.execute("SELECT * FROM tourney.matches WHERE guild_id=%s AND event_id=%s AND status IN ('pending','active') AND match_type='head_to_head' ORDER BY round_number,match_order,id LIMIT 1;",(gid,e['id'])); m=cur.fetchone()
-        if not m: conn.commit(); return {'ok':False,'reason':'no_pending_match'}
-        cur.execute('SELECT mp.*,c.name FROM tourney.match_participants mp JOIN public.characters c ON c.guild_id=mp.guild_id AND c.character_id=mp.character_id WHERE mp.match_id=%s ORDER BY slot_number;',(m['id'],)); ps=[dict(r) for r in cur.fetchall()]
-        a,b=ps[0],ps[1]; ask=skills(gid,a['character_id']); bsk=skills(gid,b['character_id']); ap=bp=0; summary=[f"**{clean(a['name'])}** faces **{clean(b['name'])}** in the {EVENT_TYPES[e['event_type']][0]}."]
-        for i in range(1,4):
-            if e['event_type']=='joust': am=ask['riding']+ask['weapon']+ask['composure']//2; bm=bsk['riding']+bsk['weapon']+bsk['composure']//2; formula='2d6 + riding + weapon + composure_half'; unit='Pass'
-            else: am=ask['duel']+ask['weapon']//2+ask['composure']//2; bm=bsk['duel']+bsk['weapon']//2+bsk['composure']//2; formula='2d6 + duel + weapon_half + composure_half'; unit='Exchange'
-            ad1,ad2,abase=roll(); bd1,bd2,bbase=roll(); at=abase+am; bt=bbase+bm
-            cur.execute('INSERT INTO tourney.match_rolls(guild_id,match_id,character_id,phase_code,roll_formula,die_1,die_2,base_total,modifier_total,rank_bonus,final_total,detail_json) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb);',(gid,m['id'],a['character_id'],f'round_{i}',formula,ad1,ad2,abase,am,ask['_bonus'],at,json.dumps({})))
-            cur.execute('INSERT INTO tourney.match_rolls(guild_id,match_id,character_id,phase_code,roll_formula,die_1,die_2,base_total,modifier_total,rank_bonus,final_total,detail_json) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb);',(gid,m['id'],b['character_id'],f'round_{i}',formula,bd1,bd2,bbase,bm,bsk['_bonus'],bt,json.dumps({})))
-            if at>bt: ap+=1; summary.append(f'{unit} {i}: **{clean(a["name"])}** takes the advantage.')
-            elif bt>at: bp+=1; summary.append(f'{unit} {i}: **{clean(b["name"])}** answers with superior form.')
-            else: summary.append(f'{unit} {i}: The competitors are evenly matched.')
-        winner=a if (ap>bp or (ap==bp and seed_score(e['event_type'],ask)>=seed_score(e['event_type'],bsk))) else b; loser=b if winner is a else a
-        summary.append(f"**{clean(winner['name']).upper()} advances!**")
-        cur.execute("UPDATE tourney.matches SET status='completed',winner_character_id=%s,narrative_summary=%s,completed_at=NOW(),updated_at=NOW() WHERE id=%s;",(winner['character_id'],'\n'.join(summary),m['id']))
-        cur.execute('UPDATE tourney.match_participants SET final_position=CASE WHEN character_id=%s THEN 1 ELSE 2 END, eliminated=CASE WHEN character_id=%s THEN FALSE ELSE TRUE END WHERE match_id=%s;',(winner['character_id'],winner['character_id'],m['id']))
-        cur.execute("UPDATE tourney.entries SET registration_status='advanced' WHERE id=%s;",(winner['entry_id'],)); cur.execute("UPDATE tourney.entries SET registration_status='eliminated' WHERE id=%s;",(loser['entry_id'],))
-        add_rp(cur,gid,winner['character_id'],1,match_wins=1); notes=auto_advance(cur,gid,t,e); conn.commit(); return {'ok':True,'event':dict(e),'summary':summary,'winner':winner,'loser':loser,'notes':notes}
 
-def scored_points(total):
-    if total>=18: return 5,'commanding'
-    if total>=15: return 4,'excellent'
-    if total>=12: return 3,'strong'
-    if total>=9: return 2,'steady'
-    return 0,'faltered'
-
-def run_scored(gid,tname,ename):
-    with db() as conn, conn.cursor() as cur:
-        t=get_t(cur,gid,tname); 
-        if not t: return {'ok':False,'reason':'tournament_not_found'}
-        e=get_e(cur,gid,t['id'],ename)
-        if not e: return {'ok':False,'reason':'event_not_found'}
-        cur.execute("SELECT en.id AS entry_id,en.character_id,en.user_id,c.name FROM tourney.entries en JOIN public.characters c ON c.guild_id=en.guild_id AND c.character_id=en.character_id WHERE en.guild_id=%s AND en.event_id=%s AND en.registration_status IN ('registered','advanced') ORDER BY COALESCE(en.seed,999999),c.name;",(gid,e['id'])); entrants=[dict(r) for r in cur.fetchall()]
-        if len(entrants)<2: return {'ok':False,'reason':'not_enough_entrants'}
-        rno=int(e['round_number'] or 0)+1; cur.execute("INSERT INTO tourney.matches(guild_id,tournament_id,event_id,round_number,match_order,status,match_type) VALUES(%s,%s,%s,%s,1,'active','scored_round') RETURNING id;",(gid,t['id'],e['id'],rno)); mid=cur.fetchone()['id']; results=[]; summary=[f"**{EVENT_TYPES[e['event_type']][0]} Round {rno} begins.**"]
-        for slot,en in enumerate(entrants,1):
-            sk=skills(gid,en['character_id'])
-            if e['event_type']=='archery': m=sk['archery']+sk['composure']//2; formula='2d6 + archery + composure_half'
-            elif e['event_type']=='horse_race': m=sk['riding']+sk['stamina']//2+sk['composure']//3; formula='2d6 + riding + stamina_half + composure_third'
-            elif e['event_type']=='hunt': m=sk['archery']+sk['stamina']//2+sk['composure']//3; formula='2d6 + archery + stamina_half + composure_third'
-            else: m=sk['duel']+sk['stamina']//2+sk['weapon']//3; formula='2d6 + duel + stamina_half + weapon_third'
-            pts=best=0
-            for seg in range(1,4):
-                d1,d2,base=roll(); total=base+m; p,label=scored_points(total); pts+=p; best=max(best,p); summary.append(f"{clean(en['name'])}'s segment {seg} is {label}."); cur.execute('INSERT INTO tourney.match_rolls(guild_id,match_id,character_id,phase_code,roll_formula,die_1,die_2,base_total,modifier_total,rank_bonus,final_total,detail_json) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb);',(gid,mid,en['character_id'],f'segment_{seg}',formula,d1,d2,base,m,sk['_bonus'],total,json.dumps({'points':p,'label':label})))
-            cur.execute('INSERT INTO tourney.match_participants(guild_id,match_id,entry_id,character_id,slot_number,points) VALUES(%s,%s,%s,%s,%s,%s);',(gid,mid,en['entry_id'],en['character_id'],slot,pts)); results.append({'entry_id':en['entry_id'],'character_id':en['character_id'],'name':clean(en['name']),'points':pts,'best':best,'tie':seed_score(e['event_type'],sk)})
-        results.sort(key=lambda x:(-x['points'],-x['best'],-x['tie'],x['name']))
-        final=len(results)==2; advance=max(2,len(results)//2)
-        for pos,r in enumerate(results,1):
-            r['position']=pos; adv=pos<=advance
-            cur.execute('UPDATE tourney.match_participants SET final_position=%s,eliminated=%s WHERE match_id=%s AND character_id=%s;',(pos,not adv,mid,r['character_id']))
-            cur.execute('UPDATE tourney.entries SET registration_status=%s WHERE id=%s;',('advanced' if adv else 'eliminated',r['entry_id']))
-            if adv and not final: add_rp(cur,gid,r['character_id'],1,match_wins=1)
-        cur.execute("UPDATE tourney.events SET status=%s,round_number=%s,updated_at=NOW() WHERE id=%s;",('ready_to_finalize' if final else 'active',rno,e['id']))
-        cur.execute("UPDATE tourney.matches SET status='completed',winner_character_id=%s,narrative_summary=%s,completed_at=NOW(),updated_at=NOW() WHERE id=%s;",(results[0]['character_id'],'\n'.join(summary),mid)); conn.commit(); return {'ok':True,'event':dict(e),'results':results,'summary':summary}
-
-def finalize_event(gid,tname,ename,actor):
-    with db() as conn, conn.cursor() as cur:
-        t=get_t(cur,gid,tname); 
-        if not t: return {'ok':False,'reason':'tournament_not_found'}
-        e=get_e(cur,gid,t['id'],ename)
-        if not e: return {'ok':False,'reason':'event_not_found'}
-        if e['status']!='ready_to_finalize': return {'ok':False,'reason':'not_ready'}
-        cur.execute("SELECT mp.character_id,c.name,mp.final_position FROM tourney.match_participants mp JOIN tourney.matches m ON m.id=mp.match_id JOIN public.characters c ON c.guild_id=mp.guild_id AND c.character_id=mp.character_id WHERE m.guild_id=%s AND m.event_id=%s ORDER BY m.round_number DESC,m.id DESC,mp.final_position ASC NULLS LAST LIMIT 10;",(gid,e['id'])); placements=[]
-        seen=set()
-        for r in cur.fetchall():
-            if r['character_id'] not in seen: seen.add(r['character_id']); placements.append(dict(r))
-        if not placements: return {'ok':False,'reason':'no_placements'}
-        total_pay=0
-        for idx,r in enumerate(placements[:3],1):
-            pts={1:5,2:3,3:2}.get(idx,0); rp=0; code='third_place'; name='Third Place'; pay=0; counters={}
-            if idx==1: rp=4; code='event_champion'; name=f"Champion of the {EVENT_TYPES[e['event_type']][0]}"; pay=EVENT_CHAMPION_PAY; counters={'event_championships':1}
-            elif idx==2: rp=1; code='event_runner_up'; name=f"Runner-Up of the {EVENT_TYPES[e['event_type']][0]}"; pay=EVENT_RUNNER_PAY; counters={'event_runner_ups':1}
-            add_rp(cur,gid,r['character_id'],rp,**counters); payout(cur,gid,r['character_id'],actor,pay,'tournament_event_payout',{'tournament':t['name'],'event':e['name'],'place':idx}); total_pay+=pay
-            cur.execute('UPDATE tourney.entries SET tournament_score=tournament_score+%s,registration_status=%s WHERE guild_id=%s AND event_id=%s AND character_id=%s;',(pts,'champion' if idx==1 else 'runner_up' if idx==2 else 'placed',gid,e['id'],r['character_id']))
-            cur.execute('INSERT INTO tourney.awards(guild_id,tournament_id,event_id,character_id,award_code,award_name,points_awarded,renown_awarded,payout_embers) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s);',(gid,t['id'],e['id'],r['character_id'],code,name,pts,rp,pay))
-            queue_refresh(cur,gid,r['character_id'],'tournament_event_finalized')
-        cur.execute("UPDATE tourney.events SET status='completed',updated_at=NOW() WHERE id=%s;",(e['id'],)); cur.execute("SELECT COUNT(*) AS n FROM tourney.events WHERE guild_id=%s AND tournament_id=%s AND status<>'completed';",(gid,t['id'])); open_n=int(cur.fetchone()['n'] or 0); cur.execute("UPDATE tourney.tournaments SET status=%s,updated_at=NOW() WHERE id=%s;",('ready_to_finalize' if open_n==0 else 'active',t['id'])); conn.commit(); return {'ok':True,'event':dict(e),'placements':placements,'total_pay':total_pay}
-
-def finalize_tourney(gid,tname,actor):
-    with db() as conn, conn.cursor() as cur:
-        t=get_t(cur,gid,tname); 
-        if not t: return {'ok':False,'reason':'tournament_not_found'}
-        cur.execute("SELECT COUNT(*) AS n FROM tourney.events WHERE guild_id=%s AND tournament_id=%s AND status<>'completed';",(gid,t['id']))
-        if int(cur.fetchone()['n'] or 0)>0: return {'ok':False,'reason':'events_not_completed'}
-        cur.execute("SELECT en.character_id,c.name,COALESCE(SUM(en.tournament_score),0) AS score FROM tourney.entries en JOIN public.characters c ON c.guild_id=en.guild_id AND c.character_id=en.character_id WHERE en.guild_id=%s AND en.tournament_id=%s AND en.registration_status<>'withdrawn' GROUP BY en.character_id,c.name ORDER BY score DESC,c.name ASC;",(gid,t['id'])); rows=[dict(r) for r in cur.fetchall()]
-        if not rows: return {'ok':False,'reason':'no_entries'}
-        champ=rows[0]; pay=payout(cur,gid,champ['character_id'],actor,OVERALL_CHAMPION_PAY,'tournament_overall_champion_payout',{'tournament':t['name']}); add_rp(cur,gid,champ['character_id'],5,overall_championships=1); cur.execute('INSERT INTO tourney.awards(guild_id,tournament_id,character_id,award_code,award_name,points_awarded,renown_awarded,payout_embers) VALUES(%s,%s,%s,%s,%s,%s,%s,%s);',(gid,t['id'],champ['character_id'],'overall_champion',f"Overall Champion of {clean(t['name'])}",champ['score'],5,pay))
-        cut=round(pay*0.10)
-        if cut and t['host_kingdom'] in CANON_KINGDOMS: cur.execute('UPDATE econ.kingdoms SET treasury_embers=treasury_embers+%s,updated_at=NOW() WHERE guild_id=%s AND kingdom=%s;',(cut,gid,t['host_kingdom']))
-        cur.execute("UPDATE tourney.tournaments SET status='completed',updated_at=NOW() WHERE id=%s;",(t['id'],)); conn.commit(); return {'ok':True,'champion':champ,'rows':rows,'pay':pay,'cut':cut}
-
-@tree.command(name='tourney-run-round',description='Staff: run the next automated round/match and auto-post results.',guild=discord.Object(id=GUILD_ID))
+@tree.command(name="tourney-status", description="Staff: view tournament status.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
-@app_commands.autocomplete(tournament=tourn_ac,event=event_ac)
-async def run_round(inter,tournament:str,event:str):
-    await inter.response.defer(ephemeral=True); gid=int(inter.guild_id or GUILD_ID)
-    with db() as conn, conn.cursor() as cur:
-        t=get_t(cur,gid,tournament); e=get_e(cur,gid,t['id'],event) if t else None
-    if not t or not e: return await inter.followup.send('Tournament or event not found.',ephemeral=True)
-    res=await run_db(run_h2h if e['format_type']=='head_to_head' else run_scored,gid,tournament,event)
-    if not res.get('ok'): return await inter.followup.send(f"Could not run round: `{clean(res.get('reason'))}`",ephemeral=True)
-    emb=discord.Embed(title=f"{clean(event)} — Round Result",color=discord.Color.gold(),description=f"**Tournament:** {clean(tournament)}\n**Event:** {EVENT_TYPES[e['event_type']][0]}")
-    if 'winner' in res: emb.add_field(name='Victor',value=f"**{clean(res['winner']['name'])}**",inline=True); emb.add_field(name='Defeated',value=f"**{clean(res['loser']['name'])}**",inline=True)
-    else: emb.add_field(name='Standings',value='\n'.join([f"{r['position']}. **{r['name']}** — {r['points']} pts" for r in res['results'][:10]]),inline=False)
-    for i,ch in enumerate(chunk(res.get('summary',[])[:20]),1): emb.add_field(name='Narration' if i==1 else f'Narration ({i})',value=ch,inline=False)
-    await public_post(inter,emb); await inter.followup.send('Round resolved and posted publicly.',ephemeral=True)
+@app_commands.autocomplete(tournament=tourney_auto)
+async def tourney_status_cmd(interaction: discord.Interaction, tournament: str):
+    await interaction.response.defer(ephemeral=True)
+    s = await run_db(tournament_status, int(interaction.guild_id or GUILD_ID), tournament)
+    if not s:
+        await interaction.followup.send("Tournament not found.", ephemeral=True); return
+    emb = discord.Embed(title=f"{clean(tournament)} — Status", color=discord.Color.blurple())
+    lines = [f"• **{clean(e['name'])}** — {event_label(e['event_type'])} | `{e['status']}` | Entrants: {s['metrics'].get(int(e['id']),0)}" for e in s["events"]]
+    emb.description = f"Host: **{clean(s['tournament'].get('host_kingdom') or 'Unassigned')}**\nStatus: `{s['tournament'].get('status')}`"
+    for i, ch in enumerate(chunk(lines or ["No events yet."]), start=1):
+        emb.add_field(name="Events" if i == 1 else f"Events {i}", value=ch, inline=False)
+    await interaction.followup.send(embed=emb, ephemeral=True)
 
-@tree.command(name='tourney-finalize-event',description='Staff: finalize an event.',guild=discord.Object(id=GUILD_ID))
+
+@tree.command(name="tourney-post-announcement", description="Staff: post tournament announcement publicly.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
-@app_commands.autocomplete(tournament=tourn_ac,event=event_ac)
-async def fin_event(inter,tournament:str,event:str):
-    await inter.response.defer(ephemeral=True); res=await run_db(finalize_event,int(inter.guild_id or GUILD_ID),tournament,event,inter.user.id)
-    if not res.get('ok'): return await inter.followup.send(f"Could not finalize event: `{clean(res.get('reason'))}`",ephemeral=True)
-    emb=discord.Embed(title=f'{clean(event)} — Final Results',color=discord.Color.gold(),description=f'**Tournament:** {clean(tournament)}')
-    for i,r in enumerate(res['placements'][:3],1): emb.add_field(name={1:'Champion',2:'Runner-Up',3:'Third Place'}[i],value=f"**{clean(r['name'])}**",inline=True)
-    await public_post(inter,emb); await inter.followup.send('Event finalized and posted publicly.',ephemeral=True)
+@app_commands.autocomplete(tournament=tourney_auto)
+async def post_announcement(interaction: discord.Interaction, tournament: str):
+    await interaction.response.defer(ephemeral=True)
+    s = await run_db(tournament_status, int(interaction.guild_id or GUILD_ID), tournament)
+    if not s:
+        await interaction.followup.send("Tournament not found.", ephemeral=True); return
+    emb = discord.Embed(title=f"{clean(tournament)} — Tournament Announcement", color=discord.Color.gold())
+    emb.description = "The lists are opened. Competitors may register for the host-selected events."
+    emb.add_field(name="Host", value=clean(s['tournament'].get('host_kingdom') or 'Unassigned'), inline=True)
+    lines = [f"• **{clean(e['name'])}** — {event_label(e['event_type'])}" for e in s["events"]]
+    emb.add_field(name="Events", value="\n".join(lines) if lines else "No events yet.", inline=False)
+    await public_post(interaction, emb)
+    await interaction.followup.send("Announcement posted publicly.", ephemeral=True)
 
-@tree.command(name='tourney-finalize',description='Staff: finalize a completed tournament.',guild=discord.Object(id=GUILD_ID))
+
+@tree.command(name="tourney-run-round", description="Staff: instantly simulate an event and post cinematic results.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
-@app_commands.autocomplete(tournament=tourn_ac)
-async def fin_tourney(inter,tournament:str):
-    await inter.response.defer(ephemeral=True); res=await run_db(finalize_tourney,int(inter.guild_id or GUILD_ID),tournament,inter.user.id)
-    if not res.get('ok'): return await inter.followup.send(f"Could not finalize tournament: `{clean(res.get('reason'))}`",ephemeral=True)
-    emb=discord.Embed(title=f'{clean(tournament)} — Overall Champion',color=discord.Color.gold(),description=f"**{clean(res['champion']['name'])}** is crowned overall champion.")
-    emb.add_field(name='Final Standings',value='\n'.join([f"{i}. **{clean(r['name'])}** — {int(r['score'])} pts" for i,r in enumerate(res['rows'][:10],1)]),inline=False)
-    if res['pay']: emb.add_field(name='Payout',value=f"{fmt_money(res['pay'])}\nHost treasury cut: {fmt_money(res['cut'])}",inline=False)
-    await public_post(inter,emb); await inter.followup.send('Tournament finalized and posted publicly.',ephemeral=True)
+@app_commands.autocomplete(tournament=tourney_auto, event=event_auto)
+async def tourney_run_round(interaction: discord.Interaction, tournament: str, event: str):
+    await interaction.response.defer(ephemeral=True)
+    res = await run_db(run_event, int(interaction.guild_id or GUILD_ID), tournament, event)
+    if not res.get("ok"):
+        await interaction.followup.send(f"Could not run event: `{clean(res.get('reason'))}`.", ephemeral=True); return
+    e = res["event"]
+    emb = discord.Embed(title=f"{clean(event)} — {event_label(e['event_type'])} Results", color=discord.Color.gold())
+    standings = [f"{r['place']}. **{clean(r['character'].name)}** — {r['score']}" for r in res["results"][:10]]
+    emb.add_field(name="Standings", value="\n".join(standings), inline=False)
+    for i, ch in enumerate(chunk(res["lines"], 1000)[:4], start=1):
+        emb.add_field(name="Cinematic Result" if i == 1 else f"Cinematic Result {i}", value=ch, inline=False)
+    emb.set_footer(text="Safe tournament mode: all injuries are narrative-only.")
+    await public_post(interaction, emb)
+    await interaction.followup.send("Event simulated and posted publicly. Use `/tourney-finalize-event` to award points/RP.", ephemeral=True)
 
-@tree.command(name='tourney-post-announcement',description='Staff: post public tournament announcement.',guild=discord.Object(id=GUILD_ID))
+
+@tree.command(name="tourney-finalize-event", description="Staff: finalize a simulated event and award score/RP.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
-@app_commands.autocomplete(tournament=tourn_ac)
-async def announcement(inter,tournament:str):
-    await inter.response.defer(ephemeral=True); gid=int(inter.guild_id or GUILD_ID)
-    with db() as conn, conn.cursor() as cur:
-        t=get_t(cur,gid,tournament)
-        if not t: return await inter.followup.send('Tournament not found.',ephemeral=True)
-        cur.execute('SELECT * FROM tourney.events WHERE guild_id=%s AND tournament_id=%s ORDER BY id;',(gid,t['id'])); events=[dict(r) for r in cur.fetchall()]
-    emb=discord.Embed(title=f"{clean(t['name'])} — Tournament Announcement",color=discord.Color.gold(),description='The lists are called, the field is marked, and competitors may gather for glory.')
-    emb.add_field(name='Host Kingdom',value=clean(t['host_kingdom'] or 'Unassigned'),inline=True); emb.add_field(name='Status',value=clean(t['status']).title(),inline=True)
-    if events: emb.add_field(name='Events',value='\n'.join([f"• **{clean(e['name'])}** — {EVENT_TYPES[e['event_type']][0]}" for e in events])[:1024],inline=False)
-    await public_post(inter,emb); await inter.followup.send('Announcement posted publicly.',ephemeral=True)
+@app_commands.autocomplete(tournament=tourney_auto, event=event_auto)
+async def tourney_finalize_event(interaction: discord.Interaction, tournament: str, event: str):
+    await interaction.response.defer(ephemeral=True)
+    res = await run_db(finalize_event_db, int(interaction.guild_id or GUILD_ID), tournament, event, interaction.user.id)
+    if not res.get("ok"):
+        await interaction.followup.send(f"Could not finalize event: `{clean(res.get('reason'))}`.", ephemeral=True); return
+    rows = res["rows"]
+    emb = discord.Embed(title=f"{clean(event)} — Finalized", color=discord.Color.gold())
+    lines = [f"{int(r['place'])}. **{clean(r['name'])}** — {EVENT_SCORE.get(int(r['place']),0)} tournament pts" for r in rows[:10]]
+    emb.description = "\n".join(lines)
+    if int(res.get("total_pay") or 0):
+        emb.add_field(name="Payouts", value=f"Total paid: **{fmt_money(int(res['total_pay']))}**", inline=False)
+    await public_post(interaction, emb)
+    await interaction.followup.send("Event finalized and posted publicly.", ephemeral=True)
 
-@tree.command(name='tourney-status',description='Staff: view tournament status.',guild=discord.Object(id=GUILD_ID))
+
+@tree.command(name="tourney-finalize", description="Staff: finalize the tournament and crown the overall champion.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
-@app_commands.autocomplete(tournament=tourn_ac)
-async def status(inter,tournament:str):
-    await inter.response.defer(ephemeral=True); gid=int(inter.guild_id or GUILD_ID)
-    with db() as conn, conn.cursor() as cur:
-        t=get_t(cur,gid,tournament)
-        if not t: return await inter.followup.send('Tournament not found.',ephemeral=True)
-        cur.execute('SELECT * FROM tourney.events WHERE guild_id=%s AND tournament_id=%s ORDER BY id;',(gid,t['id'])); events=[dict(r) for r in cur.fetchall()]
-        lines=[]
-        for e in events:
-            cur.execute("SELECT COUNT(*) AS n FROM tourney.entries WHERE guild_id=%s AND event_id=%s AND registration_status<>'withdrawn';",(gid,e['id'])); n=cur.fetchone()['n']; lines.append(f"• **{clean(e['name'])}** — {EVENT_TYPES[e['event_type']][0]} | {clean(e['status']).title()} | Entrants {n} | Round {e['round_number']}")
-    emb=discord.Embed(title=f"{clean(t['name'])} — Tournament Status",color=discord.Color.blue(),description=f"**Host:** {clean(t['host_kingdom'])}\n**Status:** {clean(t['status']).title()}")
-    for i,ch in enumerate(chunk(lines or ['No events created yet.']),1): emb.add_field(name='Events' if i==1 else f'Events ({i})',value=ch,inline=False)
-    await inter.followup.send(embed=emb,ephemeral=True)
+@app_commands.autocomplete(tournament=tourney_auto)
+async def tourney_finalize(interaction: discord.Interaction, tournament: str):
+    await interaction.response.defer(ephemeral=True)
+    res = await run_db(finalize_tournament_db, int(interaction.guild_id or GUILD_ID), tournament, interaction.user.id)
+    if not res.get("ok"):
+        await interaction.followup.send(f"Could not finalize tournament: `{clean(res.get('reason'))}`.", ephemeral=True); return
+    champ = res["champion"]
+    emb = discord.Embed(title=f"{clean(tournament)} — Overall Champion", color=discord.Color.gold())
+    emb.description = f"**{clean(champ['name'])}** is crowned overall champion."
+    lines = [f"{i}. **{clean(r['name'])}** — {int(r['score'] or 0)} pts" for i, r in enumerate(res["standings"][:10], start=1)]
+    emb.add_field(name="Final Standings", value="\n".join(lines), inline=False)
+    if int(res.get("payout") or 0):
+        emb.add_field(name="Economy", value=f"Champion payout: **{fmt_money(int(res['payout']))}**\nHost treasury cut: **{fmt_money(int(res['cut']))}**", inline=False)
+    await public_post(interaction, emb)
+    await interaction.followup.send("Tournament finalized and posted publicly.", ephemeral=True)
+
 
 @tree.error
-async def err(inter,error):
-    traceback.print_exception(type(error),error,error.__traceback__)
+async def on_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    traceback.print_exception(type(error), error, error.__traceback__)
     try:
-        if inter.response.is_done(): await inter.followup.send('TournamentBot hit an internal error. Check Railway logs.',ephemeral=True)
-        else: await inter.response.send_message('TournamentBot hit an internal error. Check Railway logs.',ephemeral=True)
-    except Exception: pass
+        if interaction.response.is_done():
+            await interaction.followup.send("TournamentBot hit an internal error. Check Railway logs.", ephemeral=True)
+        else:
+            await interaction.response.send_message("TournamentBot hit an internal error. Check Railway logs.", ephemeral=True)
+    except Exception:
+        pass
+
+
 @client.event
 async def on_ready():
-    log.info('%s logged in as %s',APP_VERSION,client.user)
-    try: await run_db(ensure_schema); log.info('Tournament schema ensured.'); log.info('Character sync: %s', await run_db(sync_chars,GUILD_ID))
-    except Exception: log.exception('Startup schema/sync failed')
-    try: synced=await tree.sync(guild=discord.Object(id=GUILD_ID)); log.info('Synced %s guild command(s): %s',len(synced),sorted(c.name for c in synced))
-    except Exception: log.exception('Command sync failed')
-def main(): client.run(DISCORD_TOKEN)
-if __name__=='__main__': main()
+    LOG.info("%s logged in as %s", APP_VERSION, client.user)
+    try:
+        await run_db(ensure_schema)
+        LOG.info("Tournament schema ensured.")
+        sync = await run_db(sync_chars, int(GUILD_ID))
+        LOG.info("Character sync: %s", sync)
+    except Exception:
+        LOG.exception("Startup schema/sync failed.")
+    try:
+        synced = await tree.sync(guild=discord.Object(id=int(GUILD_ID)))
+        LOG.info("Synced %s guild command(s): %s", len(synced), sorted(c.name for c in synced))
+    except Exception:
+        LOG.exception("Command sync failed.")
+
+
+def main():
+    client.run(str(DISCORD_TOKEN))
+
+
+if __name__ == "__main__":
+    main()
