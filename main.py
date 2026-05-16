@@ -15,7 +15,7 @@ from discord import app_commands
 import psycopg
 from psycopg.rows import dict_row
 
-APP_VERSION = "Alaris_TournamentBot_v011"
+APP_VERSION = "Alaris_TournamentBot_v012"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] TourneyBot: %(message)s")
 LOG = logging.getLogger("TourneyBot")
@@ -1760,7 +1760,13 @@ class RegisterEventsView(discord.ui.View):
             label = clean(e.get("name"))[:100]
             desc = f"{event_label(e.get('event_type'))} | {count} registered"
             options.append(discord.SelectOption(label=label, value=label, description=desc[:100]))
+
+        # Component order matters. Add dropdowns first and the submit button last
+        # so Discord displays the button beneath the selections instead of above them.
         self.add_item(RegisterEventMultiSelect(options))
+        submit = discord.ui.Button(label="Register Selected Events", style=discord.ButtonStyle.success, row=1)
+        submit.callback = self.submit_selected_events
+        self.add_item(submit)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if int(interaction.user.id) != self.owner_id:
@@ -1768,10 +1774,9 @@ class RegisterEventsView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Register Selected Events", style=discord.ButtonStyle.success)
-    async def submit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def submit_selected_events(self, interaction: discord.Interaction):
         if not self.selected_events:
-            await interaction.response.send_message("Select at least one event first.", ephemeral=True)
+            await interaction.response.send_message("Select at least one event first, then press **Register Selected Events**.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
         res = await run_db(register_many, self.guild_id, self.tournament, self.selected_events, self.character, interaction.user.id)
@@ -1782,20 +1787,31 @@ class RegisterEventsView(discord.ui.View):
             await update_event_board(self.guild_id, self.tournament, event_name)
         if res.get("registered"):
             await update_tournament_announcement(self.guild_id, self.tournament)
+
+        registered = res.get("registered", [])
+        skipped = res.get("skipped", [])
+        lines = [f"**Registration result for {clean(res['character'].name)}**"]
+        if registered:
+            lines.append("✅ Registered for: " + ", ".join(f"**{clean(e)}**" for e in registered))
+        if skipped:
+            lines.append("⚠️ Skipped: " + ", ".join(f"**{clean(s['event'])}** (`{clean(s['reason'])}`)" for s in skipped))
+        if not registered and not skipped:
+            lines.append("No registrations were made.")
+
+        # Disable controls and rewrite the original panel so the user has a visible confirmation
+        # even if they miss the ephemeral follow-up.
         for child in self.children:
             child.disabled = True
         try:
-            await interaction.message.edit(view=self)  # type: ignore[union-attr]
+            done_embed = discord.Embed(
+                title=f"Registration Submitted — {clean(self.tournament)}",
+                description="\n".join(lines),
+                color=discord.Color.green() if registered else discord.Color.orange(),
+            )
+            await interaction.message.edit(embed=done_embed, view=self)  # type: ignore[union-attr]
         except Exception:
             pass
-        registered = res.get("registered", [])
-        skipped = res.get("skipped", [])
-        lines = []
-        if registered:
-            lines.append(f"Registered **{clean(res['character'].name)}** for: " + ", ".join(f"**{clean(e)}**" for e in registered))
-        if skipped:
-            lines.append("Skipped: " + ", ".join(f"**{clean(s['event'])}** (`{clean(s['reason'])}`)" for s in skipped))
-        await interaction.followup.send("\n".join(lines) if lines else "No registrations were made.", ephemeral=True)
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
 class RegisterEventMultiSelect(discord.ui.Select):
@@ -1806,7 +1822,7 @@ class RegisterEventMultiSelect(discord.ui.Select):
         view = self.view
         if isinstance(view, RegisterEventsView):
             view.selected_events = list(self.values)
-            await interaction.response.send_message("Selected: " + ", ".join(f"**{clean(v)}**" for v in self.values), ephemeral=True)
+            await interaction.response.send_message("Selected: " + ", ".join(f"**{clean(v)}**" for v in self.values) + "\nNow press **Register Selected Events** below the dropdown.", ephemeral=True)
 
 
 @tree.command(name="tourney-register", description="Register one of your characters for one or more tournament events.", guild=discord.Object(id=GUILD_ID))
