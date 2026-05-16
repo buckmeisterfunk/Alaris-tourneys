@@ -15,7 +15,7 @@ from discord import app_commands
 import psycopg
 from psycopg.rows import dict_row
 
-APP_VERSION = "Alaris_TournamentBot_v009"
+APP_VERSION = "Alaris_TournamentBot_v010"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] TourneyBot: %(message)s")
 LOG = logging.getLogger("TourneyBot")
@@ -79,6 +79,7 @@ DATABASE_URL = env("DATABASE_URL")
 GUILD_ID = env_int("GUILD_ID")
 STAFF_ROLE_IDS = env_ids("TOURNEY_STAFF_ROLE_IDS", "STAFF_ROLE_IDS")
 ANNOUNCEMENT_CHANNEL_ID = env_int("TOURNEY_ANNOUNCEMENT_CHANNEL_ID", 1501997730908606624)
+TOURNEY_ANNOUNCEMENT_ROLE_ID = env_int("TOURNEY_ANNOUNCEMENT_ROLE_ID", 1505325360613687336)
 ECON_LOG_CHANNEL_ID = env_int("ECON_LOG_CHANNEL_ID", 1504528860237136022)
 XP_LOG_CHANNEL_ID = env_int("XP_LOG_CHANNEL_ID", 1500571564217860177)
 
@@ -211,6 +212,9 @@ def ensure_schema() -> None:
                     UNIQUE (guild_id, name)
                 );
             """)
+            cur.execute("ALTER TABLE tourney.tournaments ADD COLUMN IF NOT EXISTS announcement_channel_id BIGINT;")
+            cur.execute("ALTER TABLE tourney.tournaments ADD COLUMN IF NOT EXISTS announcement_message_id BIGINT;")
+            cur.execute("ALTER TABLE tourney.tournaments ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ;")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS tourney.events (
                     id BIGSERIAL PRIMARY KEY,
@@ -737,8 +741,33 @@ async def send_channel(
         return None
 
 
-async def announcement_post(embed: discord.Embed):
-    return await send_channel(ANNOUNCEMENT_CHANNEL_ID, embed=embed)
+async def announcement_post(embed: discord.Embed, *, ping_role: bool = False, content: Optional[str] = None):
+    msg_content = content
+    mentions = discord.AllowedMentions.none()
+    if ping_role and TOURNEY_ANNOUNCEMENT_ROLE_ID:
+        msg_content = content or f"<@&{int(TOURNEY_ANNOUNCEMENT_ROLE_ID)}>"
+        mentions = discord.AllowedMentions(roles=True, users=False, everyone=False)
+    return await send_channel(ANNOUNCEMENT_CHANNEL_ID, content=msg_content, embed=embed, allowed_mentions=mentions)
+
+
+async def edit_announcement_message(channel_id: Optional[int], message_id: Optional[int], embed: discord.Embed) -> bool:
+    if not channel_id or not message_id:
+        return False
+    ch = client.get_channel(int(channel_id))
+    if ch is None:
+        try:
+            ch = await client.fetch_channel(int(channel_id))
+        except Exception:
+            return False
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return False
+    try:
+        msg = await ch.fetch_message(int(message_id))
+        await msg.edit(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        return True
+    except Exception as exc:
+        LOG.warning("Could not edit tournament announcement %s/%s: %s", channel_id, message_id, exc)
+        return False
 
 
 async def event_post(event: dict[str, Any], embed: discord.Embed, *, content: Optional[str] = None, mention_users: bool = False):
@@ -757,6 +786,109 @@ async def log_econ(lines: list[str]):
 
 async def log_xp(lines: list[str]):
     await send_channel(XP_LOG_CHANNEL_ID, content=("**TOURNEY XP PAYOUT**\n" + "\n".join(lines))[:1900])
+
+
+def tournament_open_announcement_embed(status: dict[str, Any]) -> discord.Embed:
+    t = status["tournament"]
+    events = status["events"]
+    metrics = status.get("metrics", {})
+    emb = discord.Embed(
+        title=f"🏆 {clean(t['name'])} Is Open",
+        color=discord.Color.gold(),
+        description="Registration is live. Competitors may now register characters they own for the enabled events."
+    )
+    emb.add_field(name="Host", value=clean(t.get("host_kingdom") or "Unassigned"), inline=True)
+    emb.add_field(name="Status", value="Registration Open", inline=True)
+    lines = []
+    for e in events:
+        count = int(metrics.get(int(e["id"]), 0))
+        lines.append(f"• **{event_label(e['event_type'])}** — `{clean(e['name'])}` — {count} registered")
+    emb.add_field(name="Enabled Events", value="\n".join(lines) if lines else "No events enabled yet.", inline=False)
+    emb.add_field(
+        name="How to Register",
+        value="Use `/tourney-register` and choose this tournament, an event, and one of your characters.",
+        inline=False,
+    )
+    emb.add_field(
+        name="Registration Rules",
+        value="You may only register characters you own. A character may enter multiple events, but cannot be registered twice for the same event.",
+        inline=False,
+    )
+    emb.set_footer(text="Tournament updates will edit this announcement silently. You will only be pinged again when the tournament concludes.")
+    return emb
+
+
+def tournament_close_announcement_embed(result: dict[str, Any]) -> discord.Embed:
+    t = result["tournament"]
+    champ = result["champion"]
+    standings = result.get("standings", [])
+    event_winners = result.get("event_winners", [])
+    emb = discord.Embed(
+        title=f"👑 {clean(t['name'])} Has Concluded",
+        color=discord.Color.gold(),
+        description=f"**{clean(champ['name'])}** is crowned the overall tournament champion."
+    )
+    if event_winners:
+        lines = [f"• **{clean(r['event_name'])}** ({event_label(r['event_type'])}) — **{clean(r['winner_name'])}**" for r in event_winners]
+        for i, ch in enumerate(chunk(lines, 1000), start=1):
+            emb.add_field(name="Event Champions" if i == 1 else f"Event Champions {i}", value=ch, inline=False)
+    if standings:
+        lines = [f"{i}. **{clean(r['name'])}** — {int(r['score'] or 0)} pts" for i, r in enumerate(standings[:10], start=1)]
+        emb.add_field(name="Overall Standings", value="\n".join(lines), inline=False)
+    if int(result.get("payout") or 0):
+        emb.add_field(name="Overall Champion Reward", value=f"{fmt_money(int(result['payout']))} | {int(result.get('xp') or 0):,} XP", inline=False)
+    emb.set_footer(text="Tournament rewards have been routed through the economy and XP systems.")
+    return emb
+
+
+def open_tournament_with_events(guild_id: int, name: str, kingdom: str, notes: Optional[str], actor: int, selected_events: list[str]) -> dict[str, Any]:
+    clean_name = name.strip()
+    if not clean_name:
+        return {"ok": False, "reason": "missing_name"}
+    valid_events = [e for e in selected_events if e in EVENT_TYPES]
+    if not valid_events:
+        return {"ok": False, "reason": "no_events"}
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO tourney.tournaments (guild_id,name,host_kingdom,status,notes,created_by_user_id,opened_at)
+                VALUES (%s,%s,%s,'active',%s,%s,NOW())
+                ON CONFLICT (guild_id,name) DO UPDATE SET
+                    host_kingdom=EXCLUDED.host_kingdom,
+                    notes=EXCLUDED.notes,
+                    status='active',
+                    opened_at=COALESCE(tourney.tournaments.opened_at, NOW()),
+                    updated_at=NOW()
+                RETURNING *;
+            """, (guild_id, clean_name, kingdom, notes, actor))
+            t = dict(cur.fetchone())
+            for etype in valid_events:
+                label = event_label(etype)
+                cur.execute("""
+                    INSERT INTO tourney.events (guild_id,tournament_id,name,event_type,status,max_entrants,format_type)
+                    VALUES (%s,%s,%s,%s,'draft',NULL,%s)
+                    ON CONFLICT (guild_id,tournament_id,name) DO UPDATE SET
+                        event_type=EXCLUDED.event_type,
+                        format_type=EXCLUDED.format_type,
+                        updated_at=NOW()
+                    RETURNING *;
+                """, (guild_id, t["id"], label, etype, 'solo' if etype in SOLO_EVENTS else 'open'))
+            cur.execute("SELECT * FROM tourney.events WHERE guild_id=%s AND tournament_id=%s ORDER BY id ASC;", (guild_id, t["id"]))
+            events = [dict(r) for r in cur.fetchall()]
+            metrics = {int(e["id"]): 0 for e in events}
+        conn.commit()
+    return {"ok": True, "tournament": t, "events": events, "metrics": metrics}
+
+
+def store_tournament_announcement(guild_id: int, tournament_id: int, channel_id: int, message_id: int) -> None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE tourney.tournaments
+                   SET announcement_channel_id=%s, announcement_message_id=%s, updated_at=NOW()
+                 WHERE guild_id=%s AND id=%s;
+            """, (channel_id, message_id, guild_id, tournament_id))
+        conn.commit()
 
 def create_tournament(guild_id: int, name: str, kingdom: str, notes: Optional[str], actor: int) -> dict[str, Any]:
     with db() as conn:
@@ -1213,8 +1345,17 @@ def finalize_tournament_db(guild_id: int, tournament: str, actor: int) -> dict[s
                 VALUES (%s,%s,NULL,%s,'overall_champion',%s,%s,%s,%s);
             """, (guild_id, t["id"], int(champ["character_id"]), f"Overall Champion of {clean(tournament)}", int(champ["score"] or 0), RP_OVERALL_CHAMPION, OVERALL_WIN_PAY))
             cur.execute("UPDATE tourney.tournaments SET status='completed', updated_at=NOW() WHERE id=%s;", (t["id"],))
+            cur.execute("""
+                SELECT e.name AS event_name, e.event_type, c.name AS winner_name, er.character_id
+                  FROM tourney.event_results er
+                  JOIN tourney.events e ON e.guild_id=er.guild_id AND e.id=er.event_id
+                  JOIN public.characters c ON c.guild_id=er.guild_id AND c.character_id=er.character_id
+                 WHERE er.guild_id=%s AND er.tournament_id=%s AND er.place=1
+                 ORDER BY e.id ASC;
+            """, (guild_id, t["id"]))
+            event_winners = [dict(r) for r in cur.fetchall()]
         conn.commit()
-    return {"ok": True, "tournament": dict(t), "standings": rows, "champion": champ, "payout": OVERALL_WIN_PAY, "cut": cut, "xp": OVERALL_WIN_XP}
+    return {"ok": True, "tournament": dict(t), "standings": rows, "champion": champ, "event_winners": event_winners, "payout": OVERALL_WIN_PAY, "cut": cut, "xp": OVERALL_WIN_XP}
 
 
 
@@ -1382,6 +1523,74 @@ async def profile_view(interaction: discord.Interaction, character: str):
     await interaction.followup.send(embed=emb, ephemeral=True)
 
 
+
+class TournamentOpenView(discord.ui.View):
+    def __init__(self, *, owner_id: int, guild_id: int, name: str, host_kingdom: str, notes: Optional[str]):
+        super().__init__(timeout=900)
+        self.owner_id = int(owner_id)
+        self.guild_id = int(guild_id)
+        self.name = name
+        self.host_kingdom = host_kingdom
+        self.notes = notes
+        self.selected_events: list[str] = []
+        options = [discord.SelectOption(label=v["label"], value=k) for k, v in EVENT_TYPES.items()]
+        self.add_item(TournamentEventMultiSelect(options))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.owner_id:
+            await interaction.response.send_message("Only the staff member who opened this setup panel may use it.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Open Tournament", style=discord.ButtonStyle.success)
+    async def open_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.selected_events:
+            await interaction.response.send_message("Select at least one event before opening the tournament.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        result = await run_db(open_tournament_with_events, self.guild_id, self.name, self.host_kingdom, self.notes, interaction.user.id, self.selected_events)
+        if not result.get("ok"):
+            await interaction.followup.send(f"Could not open tournament: `{clean(result.get('reason'))}`.", ephemeral=True)
+            return
+        embed = tournament_open_announcement_embed(result)
+        msg = await announcement_post(embed, ping_role=True)
+        if msg:
+            await run_db(store_tournament_announcement, self.guild_id, int(result["tournament"]["id"]), int(msg.channel.id), int(msg.id))
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)  # type: ignore[union-attr]
+        except Exception:
+            pass
+        await interaction.followup.send(f"Opened **{clean(self.name)}** with **{len(self.selected_events)}** event(s). Announcement posted and role pinged.", ephemeral=True)
+
+
+class TournamentEventMultiSelect(discord.ui.Select):
+    def __init__(self, options: list[discord.SelectOption]):
+        super().__init__(placeholder="Select enabled events", min_values=1, max_values=len(options), options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if isinstance(view, TournamentOpenView):
+            view.selected_events = list(self.values)
+            labels = [event_label(v) for v in self.values]
+            await interaction.response.send_message("Selected events: " + ", ".join(labels), ephemeral=True)
+
+
+@tree.command(name="tourney-open", description="Staff: open a tournament with selected events and post the public announcement.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
+@staff_only()
+@app_commands.choices(host_kingdom=KINGDOM_CHOICES)
+async def tourney_open(interaction: discord.Interaction, name: str, host_kingdom: app_commands.Choice[str], notes: Optional[str] = None):
+    view = TournamentOpenView(owner_id=interaction.user.id, guild_id=int(interaction.guild_id or GUILD_ID), name=name, host_kingdom=host_kingdom.value, notes=notes)
+    embed = discord.Embed(
+        title="Open Tournament Setup",
+        color=discord.Color.gold(),
+        description=f"Tournament: **{clean(name)}**\nHost: **{clean(host_kingdom.value)}**\n\nSelect the events to enable, then click **Open Tournament**."
+    )
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
 @tree.command(name="tourney-create", description="Staff: create a tournament.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
@@ -1442,6 +1651,7 @@ async def tourney_register(interaction: discord.Interaction, tournament: str, ev
         await interaction.followup.send(f"Could not register: `{clean(res.get('reason'))}`.", ephemeral=True)
         return
     await update_event_board(gid, tournament, event)
+    await update_tournament_announcement(gid, tournament)
     await interaction.followup.send(f"Registered **{clean(res['character'].name)}** for **{clean(event)}**.", ephemeral=True)
 
 
@@ -1455,6 +1665,7 @@ async def tourney_withdraw(interaction: discord.Interaction, tournament: str, ev
         await interaction.followup.send(f"Could not withdraw: `{clean(res.get('reason'))}`.", ephemeral=True)
         return
     await update_event_board(gid, tournament, event)
+    await update_tournament_announcement(gid, tournament)
     await interaction.followup.send(f"Withdrew **{clean(res['character'].name)}** from **{clean(event)}**.", ephemeral=True)
 
 
@@ -1476,23 +1687,22 @@ async def tourney_status_cmd(interaction: discord.Interaction, tournament: str):
     await interaction.followup.send(embed=emb, ephemeral=True)
 
 
-@tree.command(name="tourney-post-announcement", description="Staff: post tournament opening announcement to the announcements channel.", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="tourney-post-announcement", description="Staff fallback: repost the tournament opening announcement and ping the tournament role.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
 @app_commands.autocomplete(tournament=tourney_auto)
 async def post_announcement(interaction: discord.Interaction, tournament: str):
     await interaction.response.defer(ephemeral=True)
-    s = await run_db(tournament_status, int(interaction.guild_id or GUILD_ID), tournament)
+    gid = int(interaction.guild_id or GUILD_ID)
+    s = await run_db(tournament_status, gid, tournament)
     if not s:
         await interaction.followup.send("Tournament not found.", ephemeral=True)
         return
-    emb = discord.Embed(title=f"{clean(tournament)} — Tournament Open", color=discord.Color.gold())
-    emb.description = "The lists are opened. Competitors may register for the host-selected events."
-    emb.add_field(name="Host", value=clean(s['tournament'].get('host_kingdom') or 'Unassigned'), inline=True)
-    lines = [f"• **{clean(e['name'])}** — {event_label(e['event_type'])}" for e in s["events"]]
-    emb.add_field(name="Events", value="\n".join(lines) if lines else "No events yet.", inline=False)
-    await announcement_post(emb)
-    await interaction.followup.send("Announcement posted to the tournament announcement channel.", ephemeral=True)
+    emb = tournament_open_announcement_embed(s)
+    msg = await announcement_post(emb, ping_role=True)
+    if msg:
+        await run_db(store_tournament_announcement, gid, int(s["tournament"]["id"]), int(msg.channel.id), int(msg.id))
+    await interaction.followup.send("Opening announcement posted to the tournament announcement channel and role pinged.", ephemeral=True)
 
 
 @tree.command(name="tourney-run-match", description="Staff: run the next solo match for Duel or Jousting in this event post.", guild=discord.Object(id=GUILD_ID))
@@ -1565,7 +1775,7 @@ async def tourney_run_round(interaction: discord.Interaction, tournament: str, e
     await interaction.followup.send(msg, ephemeral=True)
 
 
-@tree.command(name="tourney-finalize-event", description="Staff: finalize an event, award score/RP, and announce results.", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="tourney-finalize-event", description="Staff: finalize an event and post results in the linked event post.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
 @app_commands.autocomplete(tournament=tourney_auto, event=event_auto)
@@ -1583,16 +1793,18 @@ async def tourney_finalize_event(interaction: discord.Interaction, tournament: s
         emb.add_field(name="Economy", value=f"Total paid: **{fmt_money(int(res['total_pay']))}**", inline=False)
     if int(res.get("total_xp") or 0):
         emb.add_field(name="XP", value=f"Total awarded: **{int(res['total_xp']):,} XP**", inline=False)
-    await announcement_post(emb)
+    # v010: event results stay in the linked event post. The announcement channel is reserved for tournament open and tournament close only.
+    if res.get("event"):
+        await event_post(res["event"], emb)
     await update_event_board(int(interaction.guild_id or GUILD_ID), tournament, event)
     if int(res.get("total_pay") or 0):
         await log_econ([f"Event: **{clean(event)}**", f"Total paid: **{fmt_money(int(res['total_pay']))}**"])
     if int(res.get("total_xp") or 0):
         await log_xp([f"Event: **{clean(event)}**", f"Total XP: **{int(res['total_xp']):,}**"])
-    await interaction.followup.send("Event finalized and announced.", ephemeral=True)
+    await interaction.followup.send("Event finalized. Results were posted in the linked event post; no announcement ping was sent.", ephemeral=True)
 
 
-@tree.command(name="tourney-finalize", description="Staff: finalize the tournament and announce the overall champion.", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="tourney-finalize", description="Staff: finalize the tournament and announce all event winners plus the overall champion.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
 @app_commands.autocomplete(tournament=tourney_auto)
@@ -1603,20 +1815,13 @@ async def tourney_finalize(interaction: discord.Interaction, tournament: str):
         await interaction.followup.send(f"Could not finalize tournament: `{clean(res.get('reason'))}`.", ephemeral=True)
         return
     champ = res["champion"]
-    emb = discord.Embed(title=f"{clean(tournament)} — Overall Champion", color=discord.Color.gold())
-    emb.description = f"**{clean(champ['name'])}** is crowned overall champion."
-    lines = [f"{i}. **{clean(r['name'])}** — {int(r['score'] or 0)} pts" for i, r in enumerate(res["standings"][:10], start=1)]
-    emb.add_field(name="Final Standings", value="\n".join(lines), inline=False)
-    if int(res.get("payout") or 0):
-        emb.add_field(name="Economy", value=f"Champion payout: **{fmt_money(int(res['payout']))}**\nHost treasury cut: **{fmt_money(int(res['cut']))}**", inline=False)
-    if int(res.get("xp") or 0):
-        emb.add_field(name="XP", value=f"Champion XP: **{int(res['xp']):,} XP**", inline=False)
-    await announcement_post(emb)
+    emb = tournament_close_announcement_embed(res)
+    await announcement_post(emb, ping_role=True)
     if int(res.get("payout") or 0):
         await log_econ([f"Tournament: **{clean(tournament)}**", f"Overall champion payout: **{fmt_money(int(res['payout']))}**"])
     if int(res.get("xp") or 0):
         await log_xp([f"Tournament: **{clean(tournament)}**", f"Overall champion XP: **{int(res['xp']):,}**"])
-    await interaction.followup.send("Tournament finalized and announced.", ephemeral=True)
+    await interaction.followup.send("Tournament finalized. Closing announcement posted and tournament role pinged.", ephemeral=True)
 
 
 @tree.command(name="tourney-force-close", description="Staff emergency: force-close a stuck tournament without deleting records.", guild=discord.Object(id=GUILD_ID))
