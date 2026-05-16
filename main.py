@@ -15,7 +15,7 @@ from discord import app_commands
 import psycopg
 from psycopg.rows import dict_row
 
-APP_VERSION = "Alaris_TournamentBot_v008"
+APP_VERSION = "Alaris_TournamentBot_v009"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] TourneyBot: %(message)s")
 LOG = logging.getLogger("TourneyBot")
@@ -1238,7 +1238,7 @@ def force_close_tournament_db(guild_id: int, tournament: str, actor: int, reason
             events_changed = int(cur.rowcount or 0)
             cur.execute("""
                 UPDATE tourney.tournaments
-                   SET status='cancelled', notes=CONCAT(COALESCE(notes,''), '\n[Force close] ', %s), updated_at=NOW()
+                   SET status='cancelled', notes=CONCAT(COALESCE(notes,''), '\n[Force close] ', %s::text), updated_at=NOW()
                  WHERE guild_id=%s AND id=%s
                  RETURNING *;
             """, (reason, guild_id, t["id"]))
@@ -1269,7 +1269,7 @@ def admin_reset_db(guild_id: int, tournament: str, action: str, event: Optional[
             if action == "cancel_tournament":
                 cur.execute("UPDATE tourney.events SET status='cancelled', updated_at=NOW() WHERE guild_id=%s AND tournament_id=%s AND status <> 'completed';", (guild_id, t["id"]))
                 events_changed = int(cur.rowcount or 0)
-                cur.execute("UPDATE tourney.tournaments SET status='cancelled', notes=CONCAT(COALESCE(notes,''), '\n[Admin cancel] ', %s), updated_at=NOW() WHERE guild_id=%s AND id=%s;", (reason, guild_id, t["id"]))
+                cur.execute("UPDATE tourney.tournaments SET status='cancelled', notes=CONCAT(COALESCE(notes,''), '\n[Admin cancel] ', %s::text), updated_at=NOW() WHERE guild_id=%s AND id=%s;", (reason, guild_id, t["id"]))
                 conn.commit()
                 return {"ok": True, "action": action, "tournament": t, "events_changed": events_changed, "message": "Tournament cancelled."}
 
