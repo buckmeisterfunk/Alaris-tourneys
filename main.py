@@ -15,7 +15,7 @@ from discord import app_commands
 import psycopg
 from psycopg.rows import dict_row
 
-APP_VERSION = "Alaris_TournamentBot_v012"
+APP_VERSION = "Alaris_TournamentBot_v014"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] TourneyBot: %(message)s")
 LOG = logging.getLogger("TourneyBot")
@@ -280,6 +280,28 @@ def ensure_schema() -> None:
                 );
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS tourney.event_matches (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    tournament_id BIGINT NOT NULL,
+                    event_id BIGINT NOT NULL,
+                    round_number INTEGER NOT NULL,
+                    match_order INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    character_a_id BIGINT NOT NULL,
+                    character_b_id BIGINT,
+                    winner_character_id BIGINT,
+                    loser_character_id BIGINT,
+                    narrative TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    completed_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (guild_id, event_id, round_number, match_order)
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS tourney_event_matches_pending_idx ON tourney.event_matches (guild_id, event_id, round_number, status);")
+
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS tourney.awards (
                     id BIGSERIAL PRIMARY KEY,
                     guild_id BIGINT NOT NULL,
@@ -396,6 +418,21 @@ def character_by_name(guild_id: int, name: str) -> Optional[CharacterRef]:
                 FROM public.characters
                 WHERE guild_id=%s AND archived=FALSE AND name=%s LIMIT 1;
             """, (guild_id, name.strip()))
+            r = cur.fetchone()
+            if not r:
+                return None
+            return CharacterRef(guild_id, int(r["character_id"]), int(r["user_id"]), str(r["name"]), r.get("kingdom"), r.get("species"), r.get("class_name"), int(r.get("level") or 1))
+
+
+
+def character_by_id(guild_id: int, character_id: int) -> Optional[CharacterRef]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT character_id, user_id, name, kingdom, species, class_name, COALESCE(level,1) AS level
+                FROM public.characters
+                WHERE guild_id=%s AND archived=FALSE AND character_id=%s LIMIT 1;
+            """, (guild_id, int(character_id)))
             r = cur.fetchone()
             if not r:
                 return None
@@ -788,6 +825,32 @@ async def log_xp(lines: list[str]):
     await send_channel(XP_LOG_CHANNEL_ID, content=("**TOURNEY XP PAYOUT**\n" + "\n".join(lines))[:1900])
 
 
+def reward_ledger_lines(ledger: list[dict[str, Any]], *, include_place: bool = True) -> list[str]:
+    lines: list[str] = []
+    for item in ledger or []:
+        place = int(item.get("place") or 0)
+        place_prefix = f"{place}. " if include_place and place else ""
+        name = clean(item.get("name") or item.get("character_name") or "Unknown Character")
+        money = fmt_money(int(item.get("pay") or item.get("payout_embers") or 0))
+        xp = int(item.get("xp") or item.get("amount_xp") or 0)
+        points = int(item.get("points") or 0)
+        rp = int(item.get("renown") or item.get("rp") or 0)
+        extra: list[str] = []
+        if points:
+            extra.append(f"{points} tournament pts")
+        if rp:
+            extra.append(f"+{rp} RP")
+        suffix = f" | {' | '.join(extra)}" if extra else ""
+        lines.append(f"{place_prefix}**{name}** — {money} | {xp:,} XP{suffix}")
+    return lines or ["No rewards awarded."]
+
+
+def add_reward_ledger_field(embed: discord.Embed, ledger: list[dict[str, Any]], title: str = "Rewards Awarded") -> None:
+    lines = reward_ledger_lines(ledger)
+    for idx, block in enumerate(chunk(lines, 1000), start=1):
+        embed.add_field(name=title if idx == 1 else f"{title} {idx}", value=block, inline=False)
+
+
 def tournament_open_announcement_embed(status: dict[str, Any]) -> discord.Embed:
     t = status["tournament"]
     events = status["events"]
@@ -835,8 +898,8 @@ def tournament_close_announcement_embed(result: dict[str, Any]) -> discord.Embed
     if standings:
         lines = [f"{i}. **{clean(r['name'])}** — {int(r['score'] or 0)} pts" for i, r in enumerate(standings[:10], start=1)]
         emb.add_field(name="Overall Standings", value="\n".join(lines), inline=False)
-    if int(result.get("payout") or 0):
-        emb.add_field(name="Overall Champion Reward", value=f"{fmt_money(int(result['payout']))} | {int(result.get('xp') or 0):,} XP", inline=False)
+    if result.get("reward_ledger"):
+        add_reward_ledger_field(emb, result.get("reward_ledger") or [], title="Overall Champion Reward")
     emb.set_footer(text="Tournament rewards have been routed through the economy and XP systems.")
     return emb
 
@@ -1174,6 +1237,129 @@ def record_final_results(cur, guild_id: int, t: dict[str, Any], e: dict[str, Any
         cur.execute("UPDATE tourney.entries SET tournament_score=tournament_score+%s, registration_status=%s, updated_at=NOW() WHERE guild_id=%s AND event_id=%s AND character_id=%s;", (points, 'champion' if place == 1 else 'runner_up' if place == 2 else 'eliminated', guild_id, e["id"], c.character_id))
 
 
+def solo_active_entries(cur, guild_id: int, event_id: int) -> list[dict[str, Any]]:
+    cur.execute("""
+        SELECT en.id AS entry_id, en.character_id, en.user_id, c.name, COALESCE(p.renown_points,0) AS renown_points
+        FROM tourney.entries en
+        JOIN public.characters c ON c.guild_id=en.guild_id AND c.character_id=en.character_id
+        LEFT JOIN tourney.competitor_profiles p ON p.guild_id=en.guild_id AND p.character_id=en.character_id
+        WHERE en.guild_id=%s AND en.event_id=%s AND en.registration_status IN ('registered','advanced')
+        ORDER BY COALESCE(p.renown_points,0) DESC, c.name ASC;
+    """, (guild_id, event_id))
+    return [dict(r) for r in cur.fetchall()]
+
+
+def create_solo_round_matches(cur, guild_id: int, t: dict[str, Any], e: dict[str, Any], round_number: int, active: list[dict[str, Any]]) -> dict[str, Any]:
+    """Create a full seeded solo round. Odd byes are completed automatically."""
+    seeded = list(active)
+    if len(seeded) < 2:
+        return {"created": 0, "byes": 0}
+    order = 1
+    created = 0
+    byes = 0
+    while seeded:
+        high = seeded.pop(0)
+        low = seeded.pop(-1) if seeded else None
+        if low is None:
+            cur.execute("""
+                INSERT INTO tourney.event_matches (guild_id,tournament_id,event_id,round_number,match_order,status,character_a_id,character_b_id,winner_character_id,narrative,completed_at,updated_at)
+                VALUES (%s,%s,%s,%s,%s,'completed',%s,NULL,%s,'Automatic bye advancement.',NOW(),NOW())
+                ON CONFLICT (guild_id,event_id,round_number,match_order) DO NOTHING;
+            """, (guild_id, t["id"], e["id"], round_number, order, high["character_id"], high["character_id"]))
+            byes += 1
+        else:
+            cur.execute("""
+                INSERT INTO tourney.event_matches (guild_id,tournament_id,event_id,round_number,match_order,status,character_a_id,character_b_id)
+                VALUES (%s,%s,%s,%s,%s,'pending',%s,%s)
+                ON CONFLICT (guild_id,event_id,round_number,match_order) DO NOTHING;
+            """, (guild_id, t["id"], e["id"], round_number, order, high["character_id"], low["character_id"]))
+            created += 1
+        order += 1
+    cur.execute("UPDATE tourney.events SET status='active', round_number=%s, updated_at=NOW() WHERE id=%s;", (round_number, e["id"]))
+    return {"created": created, "byes": byes}
+
+
+def round_status(cur, guild_id: int, event_id: int, round_number: int) -> dict[str, int]:
+    cur.execute("""
+        SELECT COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE status='pending') AS pending,
+               COUNT(*) FILTER (WHERE status='completed') AS completed
+        FROM tourney.event_matches
+        WHERE guild_id=%s AND event_id=%s AND round_number=%s;
+    """, (guild_id, event_id, round_number))
+    r = cur.fetchone() or {}
+    return {"total": int(r.get("total") or 0), "pending": int(r.get("pending") or 0), "completed": int(r.get("completed") or 0)}
+
+
+def advance_solo_round_if_complete(cur, guild_id: int, t: dict[str, Any], e: dict[str, Any], round_number: int) -> dict[str, Any]:
+    st = round_status(cur, guild_id, int(e["id"]), round_number)
+    if st["total"] <= 0 or st["pending"] > 0:
+        return {"round_complete": False}
+
+    cur.execute("""
+        SELECT winner_character_id
+        FROM tourney.event_matches
+        WHERE guild_id=%s AND event_id=%s AND round_number=%s AND status='completed' AND winner_character_id IS NOT NULL
+        ORDER BY match_order ASC;
+    """, (guild_id, e["id"], round_number))
+    winners = [int(r["winner_character_id"]) for r in cur.fetchall()]
+    if not winners:
+        return {"round_complete": False}
+
+    cur.execute("""
+        UPDATE tourney.entries
+           SET registration_status='advanced', updated_at=NOW()
+         WHERE guild_id=%s AND event_id=%s AND character_id = ANY(%s);
+    """, (guild_id, e["id"], winners))
+
+    if len(winners) == 1:
+        champion_id = winners[0]
+        cur.execute("""
+            SELECT loser_character_id
+            FROM tourney.event_matches
+            WHERE guild_id=%s AND event_id=%s AND round_number=%s AND loser_character_id IS NOT NULL
+            ORDER BY match_order DESC, id DESC LIMIT 1;
+        """, (guild_id, e["id"], round_number))
+        lr = cur.fetchone()
+        runner_id = int(lr["loser_character_id"]) if lr and lr.get("loser_character_id") else None
+        ordered_ids = [champion_id] + ([runner_id] if runner_id else [])
+        cur.execute("""
+            SELECT c.character_id, c.user_id, c.name, c.kingdom, c.species, c.class_name, COALESCE(c.level,1) AS level
+            FROM tourney.entries en
+            JOIN public.characters c ON c.guild_id=en.guild_id AND c.character_id=en.character_id
+            WHERE en.guild_id=%s AND en.event_id=%s AND c.character_id <> ALL(%s)
+            ORDER BY c.name ASC;
+        """, (guild_id, e["id"], ordered_ids))
+        ordered: list[tuple[CharacterRef, int, str, dict[str, Any]]] = []
+        for cid, note in [(champion_id, "Victory in the final match."), (runner_id, "Defeated in the final match.")]:
+            if not cid:
+                continue
+            c = character_by_id(guild_id, cid)
+            if c:
+                cp = combat_profile(guild_id, c)
+                ordered.append((c, 100 if cid == champion_id else 75, note, cp))
+        for r in cur.fetchall():
+            c = CharacterRef(guild_id, int(r["character_id"]), int(r["user_id"]), str(r["name"]), r.get("kingdom"), r.get("species"), r.get("class_name"), int(r.get("level") or 1))
+            cp = combat_profile(guild_id, c)
+            ordered.append((c, 0, "Eliminated in an earlier round.", cp))
+        record_final_results(cur, guild_id, t, e, ordered)
+        cur.execute("UPDATE tourney.events SET status='ready_to_finalize', updated_at=NOW() WHERE id=%s;", (e["id"],))
+        return {"round_complete": True, "event_finished": True, "next_round_created": False, "winners": winners}
+
+    # Generate next round immediately, including automatic byes.
+    cur.execute("""
+        SELECT en.id AS entry_id, en.character_id, en.user_id, c.name, COALESCE(p.renown_points,0) AS renown_points
+        FROM tourney.entries en
+        JOIN public.characters c ON c.guild_id=en.guild_id AND c.character_id=en.character_id
+        LEFT JOIN tourney.competitor_profiles p ON p.guild_id=en.guild_id AND p.character_id=en.character_id
+        WHERE en.guild_id=%s AND en.event_id=%s AND en.character_id = ANY(%s)
+        ORDER BY COALESCE(p.renown_points,0) DESC, c.name ASC;
+    """, (guild_id, e["id"], winners))
+    active = [dict(r) for r in cur.fetchall()]
+    info = create_solo_round_matches(cur, guild_id, t, e, round_number + 1, active)
+    return {"round_complete": True, "event_finished": False, "next_round_created": True, "winners": winners, **info}
+
+
 def run_match_db(guild_id: int, tournament: str, event: str) -> dict[str, Any]:
     with db() as conn:
         with conn.cursor() as cur:
@@ -1190,39 +1376,58 @@ def run_match_db(guild_id: int, tournament: str, event: str) -> dict[str, Any]:
                 return {"ok": False, "reason": "not_solo_event"}
             if e["status"] in ("ready_to_finalize", "completed"):
                 return {"ok": False, "reason": "event_already_resolved"}
-            active = active_event_competitors(cur, guild_id, int(e["id"]))
-            if len(active) < 2:
-                return {"ok": False, "reason": "not_enough_entrants"}
-            # Renown seeding: highest seed faces lowest remaining seed.
-            first = active[0]
-            second = active[-1]
-            competitors = [(first[1], first[2]), (second[1], second[2])]
+
+            # Ensure the current round exists. Byes are inserted as completed rows.
+            current_round = int(e.get("round_number") or 0)
+            cur.execute("SELECT COUNT(*) AS n FROM tourney.event_matches WHERE guild_id=%s AND event_id=%s;", (guild_id, e["id"]))
+            if int(cur.fetchone()["n"] or 0) == 0:
+                active = solo_active_entries(cur, guild_id, int(e["id"]))
+                if len(active) < 2:
+                    return {"ok": False, "reason": "not_enough_entrants"}
+                current_round = 1
+                create_solo_round_matches(cur, guild_id, t, e, current_round, active)
+
+            # If the round has only byes or has just become complete, auto-advance until a pending match or event end exists.
+            while True:
+                cur.execute("SELECT round_number FROM tourney.events WHERE id=%s;", (e["id"],))
+                current_round = int((cur.fetchone() or {}).get("round_number") or current_round or 1)
+                st = round_status(cur, guild_id, int(e["id"]), current_round)
+                if st["pending"] > 0:
+                    break
+                adv = advance_solo_round_if_complete(cur, guild_id, t, e, current_round)
+                if adv.get("event_finished"):
+                    conn.commit()
+                    return {"ok": False, "reason": "event_auto_finalized_ready"}
+                if not adv.get("next_round_created"):
+                    break
+
+            cur.execute("""
+                SELECT * FROM tourney.event_matches
+                WHERE guild_id=%s AND event_id=%s AND round_number=%s AND status='pending'
+                ORDER BY match_order ASC LIMIT 1;
+            """, (guild_id, e["id"], current_round))
+            m = cur.fetchone()
+            if not m:
+                conn.commit()
+                return {"ok": False, "reason": "no_pending_matches"}
+            m = dict(m)
+            c1 = character_by_id(guild_id, int(m["character_a_id"]))
+            c2 = character_by_id(guild_id, int(m["character_b_id"])) if m.get("character_b_id") else None
+            if not c1 or not c2:
+                return {"ok": False, "reason": "character_not_found"}
+            competitors = [(c1, combat_profile(guild_id, c1)), (c2, combat_profile(guild_id, c2))]
             results, lines = simulate_event(e["event_type"], competitors)
             winner = results[0]["character"]
             loser = results[1]["character"]
+            cur.execute("""
+                UPDATE tourney.event_matches
+                   SET status='completed', winner_character_id=%s, loser_character_id=%s, narrative=%s, completed_at=NOW(), updated_at=NOW()
+                 WHERE id=%s;
+            """, (winner.character_id, loser.character_id, "\n".join(lines), m["id"]))
             cur.execute("UPDATE tourney.entries SET registration_status='eliminated', updated_at=NOW() WHERE guild_id=%s AND event_id=%s AND character_id=%s;", (guild_id, e["id"], loser.character_id))
-            cur.execute("UPDATE tourney.events SET status='active', round_number=round_number+1, updated_at=NOW() WHERE id=%s;", (e["id"],))
-            remaining = [x for x in active if x[1].character_id != loser.character_id]
-            final_ready = len(remaining) == 1
-            if final_ready:
-                ordered: list[tuple[CharacterRef, int, str, dict[str, Any]]] = []
-                ordered.append((winner, int(results[0]["score"]), str(results[0].get("note") or "Victory in the final match."), results[0]["cp"]))
-                ordered.append((loser, int(results[1]["score"]), str(results[1].get("note") or "Defeated in the final match."), results[1]["cp"]))
-                # Add prior eliminated contestants as shared lower placements, preserving enough data for participation rewards.
-                cur.execute("""
-                    SELECT c.character_id, c.user_id, c.name, c.kingdom, c.species, c.class_name, COALESCE(c.level,1) AS level
-                    FROM tourney.entries en JOIN public.characters c ON c.guild_id=en.guild_id AND c.character_id=en.character_id
-                    WHERE en.guild_id=%s AND en.event_id=%s AND en.registration_status='eliminated' AND c.character_id NOT IN (%s,%s)
-                    ORDER BY c.name ASC;
-                """, (guild_id, e["id"], winner.character_id, loser.character_id))
-                for r in cur.fetchall():
-                    c = CharacterRef(guild_id, int(r["character_id"]), int(r["user_id"]), str(r["name"]), r.get("kingdom"), r.get("species"), r.get("class_name"), int(r.get("level") or 1))
-                    cp = combat_profile(guild_id, c)
-                    ordered.append((c, 0, "Eliminated in an earlier match.", cp))
-                record_final_results(cur, guild_id, t, e, ordered)
-                cur.execute("UPDATE tourney.events SET status='ready_to_finalize', updated_at=NOW() WHERE id=%s;", (e["id"],))
+            adv = advance_solo_round_if_complete(cur, guild_id, t, e, current_round)
             conn.commit()
-    return {"ok": True, "tournament": t, "event": e, "winner": winner, "loser": loser, "results": results, "lines": lines, "final_ready": final_ready}
+    return {"ok": True, "tournament": t, "event": e, "match": m, "winner": winner, "loser": loser, "results": results, "lines": lines, **adv}
 
 
 def run_open_round_db(guild_id: int, tournament: str, event: str) -> dict[str, Any]:
@@ -1286,6 +1491,7 @@ def finalize_event_db(guild_id: int, tournament: str, event: str, actor: int) ->
                 return {"ok": False, "reason": "no_results"}
             total_pay = 0
             total_xp = 0
+            reward_ledger: list[dict[str, Any]] = []
             for r in rows:
                 cid = int(r["character_id"]); place = int(r["place"]); points = EVENT_SCORE.get(place, 0)
                 rp = RP_EVENT_WIN if place == 1 else RP_RUNNER_UP if place == 2 else 0
@@ -1297,6 +1503,15 @@ def finalize_event_db(guild_id: int, tournament: str, event: str, actor: int) ->
                 xp_pay(cur, guild_id, cid, actor, xp, "tournament_event_xp", {"tournament": tournament, "event": event, "place": place})
                 total_pay += pay
                 total_xp += xp
+                reward_ledger.append({
+                    "character_id": cid,
+                    "name": clean(r.get("name")),
+                    "place": place,
+                    "points": points,
+                    "renown": rp,
+                    "pay": pay,
+                    "xp": xp,
+                })
                 cur.execute("""
                     INSERT INTO tourney.awards (guild_id,tournament_id,event_id,character_id,award_code,award_name,points_awarded,renown_awarded,payout_embers)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s);
@@ -1307,7 +1522,7 @@ def finalize_event_db(guild_id: int, tournament: str, event: str, actor: int) ->
             open_n = int(cur.fetchone()["n"] or 0)
             cur.execute("UPDATE tourney.tournaments SET status=%s, updated_at=NOW() WHERE id=%s;", ("ready_to_finalize" if open_n == 0 else "active", t["id"]))
         conn.commit()
-    return {"ok": True, "tournament": dict(t), "event": dict(e), "rows": rows, "total_pay": total_pay, "total_xp": total_xp}
+    return {"ok": True, "tournament": dict(t), "event": dict(e), "rows": rows, "reward_ledger": reward_ledger, "total_pay": total_pay, "total_xp": total_xp}
 
 
 def finalize_tournament_db(guild_id: int, tournament: str, actor: int) -> dict[str, Any]:
@@ -1333,6 +1548,15 @@ def finalize_tournament_db(guild_id: int, tournament: str, actor: int) -> dict[s
             add_rp(cur, guild_id, int(champ["character_id"]), RP_OVERALL_CHAMPION, overall=1)
             econ_pay(cur, guild_id, int(champ["character_id"]), actor, OVERALL_WIN_PAY, "tournament_overall_champion_payout", {"tournament": tournament})
             xp_pay(cur, guild_id, int(champ["character_id"]), actor, OVERALL_WIN_XP, "tournament_overall_champion_xp", {"tournament": tournament})
+            reward_ledger = [{
+                "character_id": int(champ["character_id"]),
+                "name": clean(champ.get("name")),
+                "place": 1,
+                "points": int(champ.get("score") or 0),
+                "renown": RP_OVERALL_CHAMPION,
+                "pay": OVERALL_WIN_PAY,
+                "xp": OVERALL_WIN_XP,
+            }]
             cut = int(round(OVERALL_WIN_PAY * 0.10)) if OVERALL_WIN_PAY and t.get("host_kingdom") else 0
             if cut:
                 cur.execute("""
@@ -1355,7 +1579,7 @@ def finalize_tournament_db(guild_id: int, tournament: str, actor: int) -> dict[s
             """, (guild_id, t["id"]))
             event_winners = [dict(r) for r in cur.fetchall()]
         conn.commit()
-    return {"ok": True, "tournament": dict(t), "standings": rows, "champion": champ, "event_winners": event_winners, "payout": OVERALL_WIN_PAY, "cut": cut, "xp": OVERALL_WIN_XP}
+    return {"ok": True, "tournament": dict(t), "standings": rows, "champion": champ, "event_winners": event_winners, "reward_ledger": reward_ledger, "payout": OVERALL_WIN_PAY, "cut": cut, "xp": OVERALL_WIN_XP}
 
 
 
@@ -1502,6 +1726,48 @@ async def require_event_post_here(interaction: discord.Interaction, tournament: 
     if int(e.get("public_channel_id")) != int(interaction.channel_id or 0):
         return False, ctx, "wrong_event_post"
     return True, ctx, ""
+
+
+async def event_context_here(interaction: discord.Interaction) -> tuple[Optional[dict[str, Any]], str]:
+    """Resolve the linked tournament event from the current discussion/thread channel.
+
+    Staff should run /post-event inside the event discussion post first. After
+    that, match/round commands use the current post as context and do not need
+    tournament/event dropdowns.
+    """
+    gid = int(interaction.guild_id or GUILD_ID)
+    channel_id = int(interaction.channel_id or 0)
+    if not channel_id:
+        return None, "no_channel"
+
+    def lookup() -> Optional[dict[str, Any]]:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT t.name AS tournament_name, e.name AS event_name
+                      FROM tourney.events e
+                      JOIN tourney.tournaments t
+                        ON t.guild_id=e.guild_id AND t.id=e.tournament_id
+                     WHERE e.guild_id=%s
+                       AND e.public_channel_id=%s
+                     ORDER BY
+                       CASE WHEN e.status IN ('draft','active','ready_to_finalize') THEN 0 ELSE 1 END,
+                       e.updated_at DESC,
+                       e.id DESC
+                     LIMIT 1;
+                    """,
+                    (gid, channel_id),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return event_context(gid, str(row["tournament_name"]), str(row["event_name"]))
+
+    ctx = await run_db(lookup)
+    if not ctx:
+        return None, "no_linked_event"
+    return ctx, ""
 
 
 def format_results_lines(results: list[dict[str, Any]], limit: int = 10) -> list[str]:
@@ -1778,11 +2044,29 @@ class RegisterEventsView(discord.ui.View):
         if not self.selected_events:
             await interaction.response.send_message("Select at least one event first, then press **Register Selected Events**.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True)
+
+        # Defer as a component message update, not as a separate thinking response.
+        # This lets the bot replace the registration panel itself with a clear confirmation.
+        await interaction.response.defer(thinking=False)
+
         res = await run_db(register_many, self.guild_id, self.tournament, self.selected_events, self.character, interaction.user.id)
         if not res.get("ok"):
-            await interaction.followup.send(f"Could not register: `{clean(res.get('reason'))}`.", ephemeral=True)
+            err_text = f"Could not register: `{clean(res.get('reason'))}`."
+            err_embed = discord.Embed(title="Registration Failed", description=err_text, color=discord.Color.red())
+            try:
+                await interaction.edit_original_response(embed=err_embed, view=None)
+            except Exception:
+                try:
+                    if interaction.message:
+                        await interaction.message.edit(embed=err_embed, view=None)  # type: ignore[union-attr]
+                except Exception:
+                    pass
+            try:
+                await interaction.followup.send(err_text, ephemeral=True)
+            except Exception:
+                pass
             return
+
         for event_name in res.get("registered", []):
             await update_event_board(self.guild_id, self.tournament, event_name)
         if res.get("registered"):
@@ -1798,20 +2082,34 @@ class RegisterEventsView(discord.ui.View):
         if not registered and not skipped:
             lines.append("No registrations were made.")
 
-        # Disable controls and rewrite the original panel so the user has a visible confirmation
-        # even if they miss the ephemeral follow-up.
         for child in self.children:
             child.disabled = True
+
+        done_embed = discord.Embed(
+            title=f"Registration Submitted — {clean(self.tournament)}",
+            description="\n".join(lines),
+            color=discord.Color.green() if registered else discord.Color.orange(),
+        )
+        done_embed.set_footer(text="This panel is closed. Run /tourney-register again to register another character.")
+
+        panel_updated = False
         try:
-            done_embed = discord.Embed(
-                title=f"Registration Submitted — {clean(self.tournament)}",
-                description="\n".join(lines),
-                color=discord.Color.green() if registered else discord.Color.orange(),
-            )
-            await interaction.message.edit(embed=done_embed, view=self)  # type: ignore[union-attr]
+            await interaction.edit_original_response(embed=done_embed, view=self)
+            panel_updated = True
         except Exception:
-            pass
-        await interaction.followup.send("\n".join(lines), ephemeral=True)
+            try:
+                if interaction.message:
+                    await interaction.message.edit(embed=done_embed, view=self)  # type: ignore[union-attr]
+                    panel_updated = True
+            except Exception:
+                panel_updated = False
+
+        # Backup message, so the user gets an explicit confirmation even if Discord does not visibly refresh the panel.
+        try:
+            await interaction.followup.send("\n".join(lines), ephemeral=True)
+        except Exception:
+            if not panel_updated:
+                pass
 
 
 class RegisterEventMultiSelect(discord.ui.Select):
@@ -1904,21 +2202,20 @@ async def post_announcement(interaction: discord.Interaction, tournament: str):
     await interaction.followup.send("Opening announcement posted to the tournament announcement channel and role pinged.", ephemeral=True)
 
 
-@tree.command(name="tourney-run-match", description="Staff: run the next solo match for Duel or Jousting in this event post.", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="tourney-run-match", description="Staff: run the next solo match in the linked event post.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
-@app_commands.autocomplete(tournament=tourney_auto, event=event_auto)
-async def tourney_run_match(interaction: discord.Interaction, tournament: str, event: str):
+async def tourney_run_match(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     gid = int(interaction.guild_id or GUILD_ID)
-    ok, _ctx, reason = await require_event_post_here(interaction, tournament, event)
-    if not ok:
-        if reason == "no_event_post":
-            await interaction.followup.send("No event board is linked yet. Run `/post-event` inside this event's discussion/forum post first.", ephemeral=True)
-        elif reason == "wrong_event_post":
-            await interaction.followup.send("Run this command inside the linked event discussion/forum post.", ephemeral=True)
-        else:
-            await interaction.followup.send("Tournament/event not found.", ephemeral=True)
+    ctx, reason = await event_context_here(interaction)
+    if not ctx:
+        await interaction.followup.send("No event board is linked to this post. Run `/post-event` inside this event's discussion/forum post first.", ephemeral=True)
+        return
+    tournament = str(ctx["tournament"]["name"])
+    event = str(ctx["event"]["name"])
+    if str(ctx["event"].get("event_type")) not in SOLO_EVENTS:
+        await interaction.followup.send("This event uses open rounds, not solo matches. Use `/tourney-run-round` in this post.", ephemeral=True)
         return
     res = await run_db(run_match_db, gid, tournament, event)
     if not res.get("ok"):
@@ -1934,26 +2231,41 @@ async def tourney_run_match(interaction: discord.Interaction, tournament: str, e
     await event_post(e, emb, content=content, mention_users=True)
     await update_event_board(gid, tournament, event)
     msg = "Match resolved and posted in this event post."
-    if res.get("final_ready"):
-        msg += " This event is ready to finalize."
+    if res.get("round_complete") and not res.get("event_finished"):
+        ctx = await run_db(event_context, gid, tournament, event)
+        if ctx:
+            board = event_board_embed(ctx)
+            board.title = f"{clean(event)} — New Round Bracket"
+            await event_post(e, board)
+        msg += " Round complete; the next bracket has been posted."
+    if res.get("event_finished"):
+        fin = await run_db(finalize_event_db, gid, tournament, event, interaction.user.id)
+        if fin.get("ok"):
+            rows = fin["rows"]
+            femb = discord.Embed(title=f"{clean(event)} — Final Results", color=discord.Color.gold())
+            femb.description = "\n".join([f"{int(r['place'])}. **{clean(r['name'])}** — {EVENT_SCORE.get(int(r['place']),0)} tournament pts" for r in rows[:10]])
+            await event_post(fin["event"], femb)
+            await update_event_board(gid, tournament, event)
+            msg += " Event complete and automatically finalized."
+        else:
+            msg += f" Event reached its end but could not auto-finalize: `{clean(fin.get('reason'))}`."
     await interaction.followup.send(msg, ephemeral=True)
 
 
-@tree.command(name="tourney-run-round", description="Staff: run the next open-event round for Melee, Archery, Hunt, or Racing.", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="tourney-run-round", description="Staff: run the next open-event round in the linked event post.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
-@app_commands.autocomplete(tournament=tourney_auto, event=event_auto)
-async def tourney_run_round(interaction: discord.Interaction, tournament: str, event: str):
+async def tourney_run_round(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     gid = int(interaction.guild_id or GUILD_ID)
-    ok, _ctx, reason = await require_event_post_here(interaction, tournament, event)
-    if not ok:
-        if reason == "no_event_post":
-            await interaction.followup.send("No event board is linked yet. Run `/post-event` inside this event's discussion/forum post first.", ephemeral=True)
-        elif reason == "wrong_event_post":
-            await interaction.followup.send("Run this command inside the linked event discussion/forum post.", ephemeral=True)
-        else:
-            await interaction.followup.send("Tournament/event not found.", ephemeral=True)
+    ctx, reason = await event_context_here(interaction)
+    if not ctx:
+        await interaction.followup.send("No event board is linked to this post. Run `/post-event` inside this event's discussion/forum post first.", ephemeral=True)
+        return
+    tournament = str(ctx["tournament"]["name"])
+    event = str(ctx["event"]["name"])
+    if str(ctx["event"].get("event_type")) in SOLO_EVENTS:
+        await interaction.followup.send("This event uses solo matches, not open rounds. Use `/tourney-run-match` in this post.", ephemeral=True)
         return
     res = await run_db(run_open_round_db, gid, tournament, event)
     if not res.get("ok"):
@@ -1970,7 +2282,23 @@ async def tourney_run_round(interaction: discord.Interaction, tournament: str, e
     await update_event_board(gid, tournament, event)
     msg = "Round resolved and posted in this event post."
     if res.get("final_ready"):
-        msg += " This event is ready to finalize."
+        fin = await run_db(finalize_event_db, gid, tournament, event, interaction.user.id)
+        if fin.get("ok"):
+            rows = fin["rows"]
+            femb = discord.Embed(title=f"{clean(event)} — Final Results", color=discord.Color.gold())
+            femb.description = "\n".join([f"{int(r['place'])}. **{clean(r['name'])}** — {EVENT_SCORE.get(int(r['place']),0)} tournament pts" for r in rows[:10]])
+            await event_post(fin["event"], femb)
+            await update_event_board(gid, tournament, event)
+            msg += " Event complete and automatically finalized."
+        else:
+            msg += f" Event reached its end but could not auto-finalize: `{clean(fin.get('reason'))}`."
+    else:
+        ctx = await run_db(event_context, gid, tournament, event)
+        if ctx:
+            board = event_board_embed(ctx)
+            board.title = f"{clean(event)} — Updated Standings"
+            await event_post(e, board)
+        msg += " Updated standings have been posted."
     await interaction.followup.send(msg, ephemeral=True)
 
 
@@ -1988,18 +2316,21 @@ async def tourney_finalize_event(interaction: discord.Interaction, tournament: s
     emb = discord.Embed(title=f"{clean(event)} — Final Results", color=discord.Color.gold())
     lines = [f"{int(r['place'])}. **{clean(r['name'])}** — {EVENT_SCORE.get(int(r['place']),0)} tournament pts" for r in rows[:10]]
     emb.description = "\n".join(lines)
-    if int(res.get("total_pay") or 0):
-        emb.add_field(name="Economy", value=f"Total paid: **{fmt_money(int(res['total_pay']))}**", inline=False)
-    if int(res.get("total_xp") or 0):
-        emb.add_field(name="XP", value=f"Total awarded: **{int(res['total_xp']):,} XP**", inline=False)
+    add_reward_ledger_field(emb, res.get("reward_ledger") or [])
+    if int(res.get("total_pay") or 0) or int(res.get("total_xp") or 0):
+        emb.add_field(
+            name="Totals",
+            value=f"Currency: **{fmt_money(int(res.get('total_pay') or 0))}**\nXP queued: **{int(res.get('total_xp') or 0):,} XP**",
+            inline=False,
+        )
     # v010: event results stay in the linked event post. The announcement channel is reserved for tournament open and tournament close only.
     if res.get("event"):
         await event_post(res["event"], emb)
     await update_event_board(int(interaction.guild_id or GUILD_ID), tournament, event)
     if int(res.get("total_pay") or 0):
-        await log_econ([f"Event: **{clean(event)}**", f"Total paid: **{fmt_money(int(res['total_pay']))}**"])
+        await log_econ([f"Event: **{clean(event)}**", *reward_ledger_lines(res.get("reward_ledger") or []), f"Total paid: **{fmt_money(int(res['total_pay']))}**"])
     if int(res.get("total_xp") or 0):
-        await log_xp([f"Event: **{clean(event)}**", f"Total XP: **{int(res['total_xp']):,}**"])
+        await log_xp([f"Event: **{clean(event)}**", *reward_ledger_lines(res.get("reward_ledger") or []), f"Total XP queued: **{int(res['total_xp']):,}**"])
     await interaction.followup.send("Event finalized. Results were posted in the linked event post; no announcement ping was sent.", ephemeral=True)
 
 
@@ -2017,9 +2348,9 @@ async def tourney_finalize(interaction: discord.Interaction, tournament: str):
     emb = tournament_close_announcement_embed(res)
     await announcement_post(emb, ping_role=True)
     if int(res.get("payout") or 0):
-        await log_econ([f"Tournament: **{clean(tournament)}**", f"Overall champion payout: **{fmt_money(int(res['payout']))}**"])
+        await log_econ([f"Tournament: **{clean(tournament)}**", *reward_ledger_lines(res.get("reward_ledger") or [], include_place=False), f"Host treasury cut: **{fmt_money(int(res.get('cut') or 0))}**"])
     if int(res.get("xp") or 0):
-        await log_xp([f"Tournament: **{clean(tournament)}**", f"Overall champion XP: **{int(res['xp']):,}**"])
+        await log_xp([f"Tournament: **{clean(tournament)}**", *reward_ledger_lines(res.get("reward_ledger") or [], include_place=False)])
     await interaction.followup.send("Tournament finalized. Closing announcement posted and tournament role pinged.", ephemeral=True)
 
 
