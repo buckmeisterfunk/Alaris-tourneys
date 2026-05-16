@@ -15,7 +15,7 @@ from discord import app_commands
 import psycopg
 from psycopg.rows import dict_row
 
-APP_VERSION = "Alaris_TournamentBot_v007"
+APP_VERSION = "Alaris_TournamentBot_v008"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] TourneyBot: %(message)s")
 LOG = logging.getLogger("TourneyBot")
@@ -423,7 +423,7 @@ def search_tourneys(guild_id: int, current: str) -> list[app_commands.Choice[str
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT name FROM tourney.tournaments
-                WHERE guild_id=%s AND status <> 'completed' AND name ILIKE %s
+                WHERE guild_id=%s AND status NOT IN ('completed','cancelled') AND name ILIKE %s
                 ORDER BY id DESC LIMIT 25;
             """, (guild_id, f"%{(current or '').strip()}%"))
             rows = cur.fetchall()
@@ -1219,6 +1219,107 @@ def finalize_tournament_db(guild_id: int, tournament: str, actor: int) -> dict[s
 
 
 
+def force_close_tournament_db(guild_id: int, tournament: str, actor: int, reason: str = "") -> dict[str, Any]:
+    """Emergency close a stuck tournament without deleting records."""
+    reason = clean(reason or "Emergency closed by staff.")[:500]
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament))
+            t = cur.fetchone()
+            if not t:
+                return {"ok": False, "reason": "tournament_not_found"}
+            if t.get("status") == "completed":
+                return {"ok": False, "reason": "already_completed"}
+            cur.execute("""
+                UPDATE tourney.events
+                   SET status='cancelled', updated_at=NOW()
+                 WHERE guild_id=%s AND tournament_id=%s AND status <> 'completed';
+            """, (guild_id, t["id"]))
+            events_changed = int(cur.rowcount or 0)
+            cur.execute("""
+                UPDATE tourney.tournaments
+                   SET status='cancelled', notes=CONCAT(COALESCE(notes,''), '\n[Force close] ', %s), updated_at=NOW()
+                 WHERE guild_id=%s AND id=%s
+                 RETURNING *;
+            """, (reason, guild_id, t["id"]))
+            updated = dict(cur.fetchone())
+        conn.commit()
+    return {"ok": True, "tournament": updated, "events_changed": events_changed, "reason_text": reason}
+
+
+RESET_ACTION_CHOICES = [
+    app_commands.Choice(name="Cancel entire tournament", value="cancel_tournament"),
+    app_commands.Choice(name="Reset selected event to draft", value="reset_event"),
+    app_commands.Choice(name="Clear selected event registrations", value="clear_registrations"),
+    app_commands.Choice(name="Reopen selected event registration", value="reopen_event"),
+]
+
+
+def admin_reset_db(guild_id: int, tournament: str, action: str, event: Optional[str], actor: int, reason: str = "") -> dict[str, Any]:
+    """Staff recovery utility for stuck tests. Additive schema, no full DB wipes."""
+    reason = clean(reason or "Admin recovery action.")[:500]
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament))
+            t = cur.fetchone()
+            if not t:
+                return {"ok": False, "reason": "tournament_not_found"}
+            t = dict(t)
+
+            if action == "cancel_tournament":
+                cur.execute("UPDATE tourney.events SET status='cancelled', updated_at=NOW() WHERE guild_id=%s AND tournament_id=%s AND status <> 'completed';", (guild_id, t["id"]))
+                events_changed = int(cur.rowcount or 0)
+                cur.execute("UPDATE tourney.tournaments SET status='cancelled', notes=CONCAT(COALESCE(notes,''), '\n[Admin cancel] ', %s), updated_at=NOW() WHERE guild_id=%s AND id=%s;", (reason, guild_id, t["id"]))
+                conn.commit()
+                return {"ok": True, "action": action, "tournament": t, "events_changed": events_changed, "message": "Tournament cancelled."}
+
+            if not event:
+                return {"ok": False, "reason": "event_required"}
+            cur.execute("SELECT * FROM tourney.events WHERE guild_id=%s AND tournament_id=%s AND name=%s LIMIT 1;", (guild_id, t["id"], event))
+            e = cur.fetchone()
+            if not e:
+                return {"ok": False, "reason": "event_not_found"}
+            e = dict(e)
+
+            if action == "reset_event":
+                if e.get("status") == "completed":
+                    return {"ok": False, "reason": "event_completed_use_cancel_instead"}
+                cur.execute("DELETE FROM tourney.event_results WHERE guild_id=%s AND event_id=%s;", (guild_id, e["id"]))
+                results_deleted = int(cur.rowcount or 0)
+                cur.execute("DELETE FROM tourney.awards WHERE guild_id=%s AND event_id=%s;", (guild_id, e["id"]))
+                awards_deleted = int(cur.rowcount or 0)
+                cur.execute("""
+                    UPDATE tourney.entries
+                       SET registration_status='registered', tournament_score=0, seed=NULL, updated_at=NOW()
+                     WHERE guild_id=%s AND event_id=%s AND registration_status <> 'withdrawn';
+                """, (guild_id, e["id"]))
+                entries_reset = int(cur.rowcount or 0)
+                cur.execute("UPDATE tourney.events SET status='draft', round_number=0, updated_at=NOW() WHERE guild_id=%s AND id=%s;", (guild_id, e["id"]))
+                cur.execute("UPDATE tourney.tournaments SET status='draft', updated_at=NOW() WHERE guild_id=%s AND id=%s AND status <> 'cancelled';", (guild_id, t["id"]))
+                conn.commit()
+                return {"ok": True, "action": action, "tournament": t, "event": e, "results_deleted": results_deleted, "awards_deleted": awards_deleted, "entries_reset": entries_reset, "message": "Event reset to draft."}
+
+            if action == "clear_registrations":
+                if e.get("status") not in ("draft", "cancelled"):
+                    return {"ok": False, "reason": "event_already_started_reset_event_first"}
+                cur.execute("UPDATE tourney.entries SET registration_status='withdrawn', updated_at=NOW() WHERE guild_id=%s AND event_id=%s AND registration_status <> 'withdrawn';", (guild_id, e["id"]))
+                cleared = int(cur.rowcount or 0)
+                cur.execute("UPDATE tourney.events SET status='draft', round_number=0, updated_at=NOW() WHERE guild_id=%s AND id=%s;", (guild_id, e["id"]))
+                conn.commit()
+                return {"ok": True, "action": action, "tournament": t, "event": e, "cleared": cleared, "message": "Event registrations cleared."}
+
+            if action == "reopen_event":
+                if e.get("status") == "completed":
+                    return {"ok": False, "reason": "event_completed_cannot_reopen"}
+                cur.execute("UPDATE tourney.events SET status='draft', updated_at=NOW() WHERE guild_id=%s AND id=%s;", (guild_id, e["id"]))
+                cur.execute("UPDATE tourney.tournaments SET status='draft', updated_at=NOW() WHERE guild_id=%s AND id=%s AND status <> 'cancelled';", (guild_id, t["id"]))
+                conn.commit()
+                return {"ok": True, "action": action, "tournament": t, "event": e, "message": "Event reopened for registration."}
+
+            return {"ok": False, "reason": "unknown_action"}
+
+
+
 async def update_event_board(guild_id: int, tournament: str, event: str) -> Optional[discord.Message]:
     """Edit an existing /post-event board only.
 
@@ -1516,6 +1617,60 @@ async def tourney_finalize(interaction: discord.Interaction, tournament: str):
     if int(res.get("xp") or 0):
         await log_xp([f"Tournament: **{clean(tournament)}**", f"Overall champion XP: **{int(res['xp']):,}**"])
     await interaction.followup.send("Tournament finalized and announced.", ephemeral=True)
+
+
+@tree.command(name="tourney-force-close", description="Staff emergency: force-close a stuck tournament without deleting records.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
+@staff_only()
+@app_commands.autocomplete(tournament=tourney_auto)
+async def tourney_force_close(interaction: discord.Interaction, tournament: str, reason: Optional[str] = None):
+    await interaction.response.defer(ephemeral=True)
+    gid = int(interaction.guild_id or GUILD_ID)
+    res = await run_db(force_close_tournament_db, gid, tournament, interaction.user.id, reason or "Emergency force-close requested by staff.")
+    if not res.get("ok"):
+        await interaction.followup.send(f"Could not force-close tournament: `{clean(res.get('reason'))}`.", ephemeral=True)
+        return
+    emb = discord.Embed(title=f"{clean(tournament)} — Tournament Closed", color=discord.Color.red())
+    emb.description = "This tournament has been force-closed by staff. Existing records were preserved."
+    emb.add_field(name="Reason", value=clean(res.get("reason_text") or "—")[:1024], inline=False)
+    emb.add_field(name="Events Closed", value=str(int(res.get("events_changed") or 0)), inline=True)
+    await announcement_post(emb)
+    await interaction.followup.send(f"Force-closed **{clean(tournament)}**. Existing records were preserved.", ephemeral=True)
+
+
+@tree.command(name="tourney-admin-reset", description="Staff recovery: cancel a tournament, reset an event, or clear stuck registrations.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
+@staff_only()
+@app_commands.autocomplete(tournament=tourney_auto, event=event_auto)
+@app_commands.choices(action=RESET_ACTION_CHOICES)
+async def tourney_admin_reset(interaction: discord.Interaction, tournament: str, action: app_commands.Choice[str], event: Optional[str] = None, reason: Optional[str] = None):
+    await interaction.response.defer(ephemeral=True)
+    gid = int(interaction.guild_id or GUILD_ID)
+    res = await run_db(admin_reset_db, gid, tournament, action.value, event, interaction.user.id, reason or "Admin recovery action.")
+    if not res.get("ok"):
+        reason_code = clean(res.get("reason"))
+        if reason_code == "event_required":
+            await interaction.followup.send("That reset action requires an event name.", ephemeral=True)
+        else:
+            await interaction.followup.send(f"Could not reset: `{reason_code}`.", ephemeral=True)
+        return
+    if event:
+        await update_event_board(gid, tournament, event)
+    if action.value == "cancel_tournament":
+        emb = discord.Embed(title=f"{clean(tournament)} — Tournament Cancelled", color=discord.Color.red())
+        emb.description = "This tournament has been cancelled by staff. Existing historical records were preserved."
+        emb.add_field(name="Reason", value=clean(reason or "Admin recovery action.")[:1024], inline=False)
+        await announcement_post(emb)
+    summary_bits = [f"Action: `{clean(action.value)}`", f"Tournament: **{clean(tournament)}**"]
+    if event:
+        summary_bits.append(f"Event: **{clean(event)}**")
+    if "entries_reset" in res:
+        summary_bits.append(f"Entries reset: **{int(res.get('entries_reset') or 0)}**")
+    if "cleared" in res:
+        summary_bits.append(f"Registrations cleared: **{int(res.get('cleared') or 0)}**")
+    if "events_changed" in res:
+        summary_bits.append(f"Events changed: **{int(res.get('events_changed') or 0)}**")
+    await interaction.followup.send("\n".join(summary_bits), ephemeral=True)
 
 @tree.error
 async def on_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
