@@ -8,7 +8,7 @@ from discord import app_commands
 import psycopg
 from psycopg.rows import dict_row
 
-APP_VERSION='Alaris_TournamentBot_v001'
+APP_VERSION='Alaris_TournamentBot_v002'
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] TourneyBot: %(message)s')
 log=logging.getLogger('TourneyBot')
 CANON_KINGDOMS=['Ephel Duath','Galadon','Mullaghmore','Frerinn','Vornladuhr','Vidalia','Idolea','Chiron']
@@ -114,26 +114,74 @@ def search_chars(guild_id:int,current:str,owner:Optional[int]=None):
         cur.execute(f'SELECT name FROM public.characters WHERE guild_id=%s {where} AND archived=FALSE AND name ILIKE %s ORDER BY name LIMIT 25;',params)
         return [app_commands.Choice(name=clean(r['name'])[:100], value=clean(r['name'])[:100]) for r in cur.fetchall()]
 
+def _table_columns(cur, table: str) -> set[str]:
+    schema, name = table.split('.', 1)
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s;
+        """,
+        (schema, name),
+    )
+    return {str(r['column_name']).lower() for r in cur.fetchall()}
+
+
 def stats_for(guild_id:int,cid:int):
+    """Fetch Alaris stats without assuming every table has guild_id.
+
+    v002 safety fix: live public.alaris_character_stats may be keyed only by
+    character_id/id and may not contain guild_id. We inspect columns first and
+    build the WHERE clause from columns that actually exist.
+    """
     defaults={'str':10,'dex':10,'con':10,'int':10,'wis':10,'cha':10}
-    aliases={'str':['str','strength'],'dex':['dex','dexterity','agility'],'con':['con','constitution','endurance'],'int':['int','intelligence'],'wis':['wis','wisdom'],'cha':['cha','charisma','presence']}
+    aliases={
+        'str':['str','strength','stat_str','stat_strength'],
+        'dex':['dex','dexterity','agility','stat_dex','stat_dexterity'],
+        'con':['con','constitution','endurance','stat_con','stat_constitution'],
+        'int':['int','intelligence','stat_int','stat_intelligence'],
+        'wis':['wis','wisdom','stat_wis','stat_wisdom'],
+        'cha':['cha','charisma','presence','stat_cha','stat_charisma'],
+    }
     def norm(row):
         lower={str(k).lower():v for k,v in dict(row).items()}; out=dict(defaults)
         for key,names in aliases.items():
             for n in names:
                 if n in lower and lower[n] is not None:
-                    try: out[key]=int(lower[n]); break
-                    except Exception: pass
+                    try:
+                        out[key]=int(lower[n]); break
+                    except Exception:
+                        pass
         return out
+
+    candidates=[
+        ('public.alaris_character_stats',['character_id','id','alaris_character_id']),
+        ('public.alaris_characters',['id','character_id']),
+        ('public.characters',['character_id','id']),
+    ]
     with db() as conn, conn.cursor() as cur:
-        for table, col in [('public.alaris_character_stats','character_id'),('public.alaris_characters','id'),('public.characters','character_id')]:
+        for table, id_cols in candidates:
             cur.execute('SELECT to_regclass(%s) AS t;',(table,))
-            if not (cur.fetchone() or {}).get('t'): continue
-            cur.execute(f'SELECT * FROM {table} WHERE guild_id=%s AND {col}=%s LIMIT 1;',(guild_id,cid))
+            if not (cur.fetchone() or {}).get('t'):
+                continue
+            cols=_table_columns(cur, table)
+            id_col=next((c for c in id_cols if c.lower() in cols), None)
+            if not id_col:
+                continue
+            where=[f'{id_col}=%s']; params=[cid]
+            if 'guild_id' in cols:
+                where.insert(0,'guild_id=%s'); params.insert(0,guild_id)
+            # Avoid archived/inactive rows when the columns exist.
+            if 'archived' in cols:
+                where.append('COALESCE(archived, FALSE) = FALSE')
+            if 'status' in cols:
+                where.append("COALESCE(status, 'active') = 'active'")
+            cur.execute(f"SELECT * FROM {table} WHERE {' AND '.join(where)} LIMIT 1;", tuple(params))
             r=cur.fetchone()
             if r:
                 s=norm(r)
-                if s!=defaults or table.endswith('characters'): return s
+                if s!=defaults or table.endswith('characters'):
+                    return s
     return defaults
 
 def profile(guild_id:int,cid:int):
