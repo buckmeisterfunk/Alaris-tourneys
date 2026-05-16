@@ -15,7 +15,7 @@ from discord import app_commands
 import psycopg
 from psycopg.rows import dict_row
 
-APP_VERSION = "Alaris_TournamentBot_v005"
+APP_VERSION = "Alaris_TournamentBot_v006"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] TourneyBot: %(message)s")
 LOG = logging.getLogger("TourneyBot")
@@ -288,6 +288,24 @@ def ensure_schema() -> None:
                     renown_awarded INTEGER NOT NULL DEFAULT 0,
                     payout_embers BIGINT NOT NULL DEFAULT 0,
                     awarded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS public.alaris_xp_award_queue (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    character_id BIGINT NOT NULL,
+                    source_bot TEXT NOT NULL DEFAULT 'unknown',
+                    source_type TEXT NOT NULL DEFAULT 'unspecified',
+                    amount_xp INTEGER NOT NULL DEFAULT 0,
+                    reason TEXT,
+                    details_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    requested_by_user_id BIGINT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    claimed_at TIMESTAMPTZ,
+                    processed_at TIMESTAMPTZ,
+                    error_text TEXT
                 );
             """)
             cur.execute("""
@@ -633,28 +651,23 @@ def econ_pay(cur, guild_id: int, cid: int, actor: Optional[int], amount: int, ac
 
 
 def xp_pay(cur, guild_id: int, cid: int, actor: Optional[int], amount_xp: int, action: str, details: dict[str, Any]) -> None:
+    """Queue XP for AlarisBot to process through the central advancement system.
+
+    TournamentBot must not update xp_total, level, damage die, or level-up state directly.
+    AlarisBot v109+ consumes this queue via LISTEN/NOTIFY plus fallback polling.
+    """
     amount = int(amount_xp or 0)
     if amount <= 0:
         return
-    # Compatibility mirror. AlarisBot remains source of truth, but this keeps cards/current sheets responsive.
+    reason = str(details.get("reason") or details.get("event") or details.get("tournament") or action)
+    payload = {**details, "xp_awarded": amount, "queued_by": APP_VERSION}
     cur.execute("""
-        UPDATE public.characters
-        SET xp_total = COALESCE(xp_total, 0) + %s, updated_at = NOW()
-        WHERE guild_id = %s AND character_id = %s;
-    """, (amount, guild_id, cid))
-    cur.execute("SELECT to_regclass('public.alaris_characters') AS table_name;")
-    has_alaris = cur.fetchone()
-    if has_alaris and has_alaris.get('table_name'):
-        cur.execute("""
-            UPDATE public.alaris_characters
-            SET xp_total = COALESCE(xp_total, 0) + %s, updated_at = NOW()
-            WHERE guild_id = %s AND id = %s;
-        """, (amount, guild_id, cid))
-    cur.execute("""
-        INSERT INTO econ.transactions (guild_id, character_id, actor_user_id, action, amount_embers, details_json)
-        VALUES (%s,%s,%s,%s,0,%s::jsonb);
-    """, (guild_id, cid, actor, action, json.dumps({**details, 'xp_awarded': amount})))
-    cur.execute("INSERT INTO public.alaris_character_refresh_queue (guild_id, character_id, reason) VALUES (%s,%s,'tournament_xp_payout');", (guild_id, cid))
+        INSERT INTO public.alaris_xp_award_queue (
+            guild_id, character_id, source_bot, source_type, amount_xp,
+            reason, details_json, requested_by_user_id, status, created_at
+        )
+        VALUES (%s,%s,'Alaris_TournamentBot',%s,%s,%s,%s::jsonb,%s,'pending',NOW());
+    """, (guild_id, cid, action, amount, reason, json.dumps(payload), actor))
 
 
 async def is_staff(interaction: discord.Interaction) -> bool:
