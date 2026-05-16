@@ -15,7 +15,7 @@ from discord import app_commands
 import psycopg
 from psycopg.rows import dict_row
 
-APP_VERSION = "Alaris_TournamentBot_v010"
+APP_VERSION = "Alaris_TournamentBot_v011"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] TourneyBot: %(message)s")
 LOG = logging.getLogger("TourneyBot")
@@ -806,7 +806,7 @@ def tournament_open_announcement_embed(status: dict[str, Any]) -> discord.Embed:
     emb.add_field(name="Enabled Events", value="\n".join(lines) if lines else "No events enabled yet.", inline=False)
     emb.add_field(
         name="How to Register",
-        value="Use `/tourney-register` and choose this tournament, an event, and one of your characters.",
+        value="Use `/tourney-register`, choose one of your characters, then select one or more enabled events.",
         inline=False,
     )
     emb.add_field(
@@ -1641,18 +1641,201 @@ async def post_event(interaction: discord.Interaction, tournament: str, event: s
     await interaction.followup.send("Event board posted and linked. Registrations and round results will update this post.", ephemeral=True)
 
 
-@tree.command(name="tourney-register", description="Register one of your characters for a tournament event.", guild=discord.Object(id=GUILD_ID))
-@app_commands.autocomplete(tournament=tourney_auto, event=event_auto, character=owned_char_auto)
-async def tourney_register(interaction: discord.Interaction, tournament: str, event: str, character: str):
+def registerable_events_for_tournament(guild_id: int, tournament: str) -> dict[str, Any]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament))
+            t = cur.fetchone()
+            if not t:
+                return {"ok": False, "reason": "tournament_not_found", "events": []}
+            cur.execute(
+                """
+                SELECT e.*,
+                       COUNT(en.*) FILTER (WHERE en.registration_status='registered') AS registered_count
+                  FROM tourney.events e
+                  LEFT JOIN tourney.entries en
+                    ON en.guild_id=e.guild_id
+                   AND en.event_id=e.id
+                 WHERE e.guild_id=%s
+                   AND e.tournament_id=%s
+                   AND e.status='draft'
+                 GROUP BY e.id
+                 ORDER BY e.id ASC;
+                """,
+                (guild_id, t["id"]),
+            )
+            events = [dict(r) for r in cur.fetchall()]
+    return {"ok": True, "tournament": dict(t), "events": events}
+
+
+def register_many(guild_id: int, tournament: str, event_names: list[str], character: str, actor: int) -> dict[str, Any]:
+    c = character_by_name(guild_id, character)
+    if not c:
+        return {"ok": False, "reason": "character_not_found"}
+    if int(c.user_id) != int(actor):
+        return {"ok": False, "reason": "not_owner"}
+
+    selected = [str(e or "").strip() for e in event_names if str(e or "").strip()]
+    if not selected:
+        return {"ok": False, "reason": "no_events_selected"}
+
+    registered: list[str] = []
+    skipped: list[dict[str, str]] = []
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM tourney.tournaments WHERE guild_id=%s AND name=%s LIMIT 1;", (guild_id, tournament))
+            t = cur.fetchone()
+            if not t:
+                return {"ok": False, "reason": "tournament_not_found"}
+
+            for event_name in selected:
+                cur.execute("SELECT * FROM tourney.events WHERE guild_id=%s AND tournament_id=%s AND name=%s LIMIT 1;", (guild_id, t["id"], event_name))
+                e = cur.fetchone()
+                if not e:
+                    skipped.append({"event": event_name, "reason": "event_not_found"})
+                    continue
+                if e["status"] != "draft":
+                    skipped.append({"event": event_name, "reason": "registration_closed"})
+                    continue
+
+                cur.execute(
+                    """
+                    SELECT registration_status
+                      FROM tourney.entries
+                     WHERE guild_id=%s AND event_id=%s AND character_id=%s
+                     LIMIT 1;
+                    """,
+                    (guild_id, e["id"], c.character_id),
+                )
+                existing = cur.fetchone()
+                if existing and existing.get("registration_status") != "withdrawn":
+                    skipped.append({"event": event_name, "reason": "already_registered"})
+                    continue
+
+                cur.execute("SELECT COUNT(*) AS n FROM tourney.entries WHERE guild_id=%s AND event_id=%s AND registration_status='registered';", (guild_id, e["id"]))
+                if e.get("max_entrants") and int(cur.fetchone()["n"] or 0) >= int(e["max_entrants"]):
+                    skipped.append({"event": event_name, "reason": "event_full"})
+                    continue
+
+                cur.execute(
+                    """
+                    INSERT INTO tourney.entries (guild_id,tournament_id,event_id,character_id,user_id,registration_status)
+                    VALUES (%s,%s,%s,%s,%s,'registered')
+                    ON CONFLICT (guild_id,event_id,character_id)
+                    DO UPDATE SET registration_status='registered', updated_at=NOW()
+                    WHERE tourney.entries.registration_status='withdrawn';
+                    """,
+                    (guild_id, t["id"], e["id"], c.character_id, c.user_id),
+                )
+                registered.append(event_name)
+
+            if registered:
+                cur.execute(
+                    """
+                    INSERT INTO tourney.competitor_profiles (guild_id,character_id,events_entered)
+                    VALUES (%s,%s,%s)
+                    ON CONFLICT (guild_id,character_id)
+                    DO UPDATE SET events_entered=tourney.competitor_profiles.events_entered+EXCLUDED.events_entered,
+                                  updated_at=NOW();
+                    """,
+                    (guild_id, c.character_id, len(registered)),
+                )
+        conn.commit()
+
+    return {"ok": True, "character": c, "registered": registered, "skipped": skipped}
+
+
+class RegisterEventsView(discord.ui.View):
+    def __init__(self, *, owner_id: int, guild_id: int, tournament: str, character: str, events: list[dict[str, Any]]):
+        super().__init__(timeout=900)
+        self.owner_id = int(owner_id)
+        self.guild_id = int(guild_id)
+        self.tournament = tournament
+        self.character = character
+        self.selected_events: list[str] = []
+        options: list[discord.SelectOption] = []
+        for e in events[:25]:
+            count = int(e.get("registered_count") or 0)
+            label = clean(e.get("name"))[:100]
+            desc = f"{event_label(e.get('event_type'))} | {count} registered"
+            options.append(discord.SelectOption(label=label, value=label, description=desc[:100]))
+        self.add_item(RegisterEventMultiSelect(options))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) != self.owner_id:
+            await interaction.response.send_message("Only the player who opened this registration panel may use it.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Register Selected Events", style=discord.ButtonStyle.success)
+    async def submit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.selected_events:
+            await interaction.response.send_message("Select at least one event first.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        res = await run_db(register_many, self.guild_id, self.tournament, self.selected_events, self.character, interaction.user.id)
+        if not res.get("ok"):
+            await interaction.followup.send(f"Could not register: `{clean(res.get('reason'))}`.", ephemeral=True)
+            return
+        for event_name in res.get("registered", []):
+            await update_event_board(self.guild_id, self.tournament, event_name)
+        if res.get("registered"):
+            await update_tournament_announcement(self.guild_id, self.tournament)
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.message.edit(view=self)  # type: ignore[union-attr]
+        except Exception:
+            pass
+        registered = res.get("registered", [])
+        skipped = res.get("skipped", [])
+        lines = []
+        if registered:
+            lines.append(f"Registered **{clean(res['character'].name)}** for: " + ", ".join(f"**{clean(e)}**" for e in registered))
+        if skipped:
+            lines.append("Skipped: " + ", ".join(f"**{clean(s['event'])}** (`{clean(s['reason'])}`)" for s in skipped))
+        await interaction.followup.send("\n".join(lines) if lines else "No registrations were made.", ephemeral=True)
+
+
+class RegisterEventMultiSelect(discord.ui.Select):
+    def __init__(self, options: list[discord.SelectOption]):
+        super().__init__(placeholder="Select one or more events to register for", min_values=1, max_values=max(1, len(options)), options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if isinstance(view, RegisterEventsView):
+            view.selected_events = list(self.values)
+            await interaction.response.send_message("Selected: " + ", ".join(f"**{clean(v)}**" for v in self.values), ephemeral=True)
+
+
+@tree.command(name="tourney-register", description="Register one of your characters for one or more tournament events.", guild=discord.Object(id=GUILD_ID))
+@app_commands.autocomplete(tournament=tourney_auto, character=owned_char_auto)
+async def tourney_register(interaction: discord.Interaction, tournament: str, character: str):
     await interaction.response.defer(ephemeral=True)
     gid = int(interaction.guild_id or GUILD_ID)
-    res = await run_db(register, gid, tournament, event, character, interaction.user.id, await is_staff(interaction))
-    if not res.get("ok"):
-        await interaction.followup.send(f"Could not register: `{clean(res.get('reason'))}`.", ephemeral=True)
+    c = await run_db(character_by_name, gid, character)
+    if not c:
+        await interaction.followup.send("Character not found.", ephemeral=True)
         return
-    await update_event_board(gid, tournament, event)
-    await update_tournament_announcement(gid, tournament)
-    await interaction.followup.send(f"Registered **{clean(res['character'].name)}** for **{clean(event)}**.", ephemeral=True)
+    if int(c.user_id) != int(interaction.user.id):
+        await interaction.followup.send("You may only register characters you own.", ephemeral=True)
+        return
+    data = await run_db(registerable_events_for_tournament, gid, tournament)
+    if not data.get("ok"):
+        await interaction.followup.send(f"Could not load events: `{clean(data.get('reason'))}`.", ephemeral=True)
+        return
+    events = data.get("events", [])
+    if not events:
+        await interaction.followup.send("There are no open events available for registration in that tournament.", ephemeral=True)
+        return
+    view = RegisterEventsView(owner_id=interaction.user.id, guild_id=gid, tournament=tournament, character=character, events=events)
+    embed = discord.Embed(
+        title=f"Register for {clean(tournament)}",
+        color=discord.Color.gold(),
+        description=f"Character: **{clean(c.name)}**\nSelect one or more events, then press **Register Selected Events**."
+    )
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 @tree.command(name="tourney-withdraw", description="Withdraw one of your characters before an event is run.", guild=discord.Object(id=GUILD_ID))
