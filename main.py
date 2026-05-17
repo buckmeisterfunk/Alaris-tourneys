@@ -15,7 +15,7 @@ from discord import app_commands
 import psycopg
 from psycopg.rows import dict_row
 
-APP_VERSION = "Alaris_TournamentBot_v014"
+APP_VERSION = "Alaris_TournamentBot_v021"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] TourneyBot: %(message)s")
 LOG = logging.getLogger("TourneyBot")
@@ -89,12 +89,14 @@ THIRD_XP = env_int("TOURNEY_THIRD_XP", 50) or 50
 RUNNER_UP_XP = env_int("TOURNEY_RUNNER_UP_XP", 75) or 75
 EVENT_WIN_XP = env_int("TOURNEY_EVENT_WIN_XP", 125) or 125
 OVERALL_WIN_XP = env_int("TOURNEY_OVERALL_WIN_XP", 200) or 200
+MAX_TOURNEY_XP_PER_CHARACTER = env_int("TOURNEY_MAX_XP_PER_CHARACTER", 1000) or 1000
 
-PARTICIPATION_PAY = env_int("TOURNEY_PARTICIPATION_EMBERS", 50) or 50
-THIRD_PAY = env_int("TOURNEY_THIRD_EMBERS", 150) or 150
-RUNNER_PAY = env_int("TOURNEY_RUNNER_UP_EMBERS", 250) or 250
-EVENT_WIN_PAY = env_int("TOURNEY_EVENT_WIN_EMBERS", 500) or 500
-OVERALL_WIN_PAY = env_int("TOURNEY_OVERALL_WIN_EMBERS", 1000) or 1000
+# v021 locked rewards: 1,000 XP cap, low currency prestige rewards. Currency should not become a fast path to asset tiers.
+PARTICIPATION_PAY = env_int("TOURNEY_PARTICIPATION_EMBERS", 10) or 10
+THIRD_PAY = env_int("TOURNEY_THIRD_EMBERS", 25) or 25
+RUNNER_PAY = env_int("TOURNEY_RUNNER_UP_EMBERS", 50) or 50
+EVENT_WIN_PAY = env_int("TOURNEY_EVENT_WIN_EMBERS", 100) or 100
+OVERALL_WIN_PAY = env_int("TOURNEY_OVERALL_WIN_EMBERS", 250) or 250
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN")
@@ -279,6 +281,32 @@ def ensure_schema() -> None:
                     UNIQUE (guild_id, event_id, character_id)
                 );
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tourney.champions (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    tournament_id BIGINT NOT NULL,
+                    character_id BIGINT NOT NULL,
+                    champion_type TEXT NOT NULL DEFAULT 'overall',
+                    title TEXT NOT NULL,
+                    awarded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (guild_id, tournament_id, character_id, champion_type)
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tourney.event_wins (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    tournament_id BIGINT NOT NULL,
+                    event_id BIGINT NOT NULL,
+                    character_id BIGINT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    awarded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE (guild_id, event_id, character_id)
+                );
+            """)
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS tourney.event_matches (
                     id BIGSERIAL PRIMARY KEY,
@@ -838,12 +866,14 @@ async def event_post(event: dict[str, Any], embed: discord.Embed, *, content: Op
     )
 
 
-async def log_econ(lines: list[str]):
-    await send_channel(ECON_LOG_CHANNEL_ID, content=("**TOURNEY ECON PAYOUT**\n" + "\n".join(lines))[:1900])
+async def log_econ(lines: list[str]) -> bool:
+    msg = await send_channel(ECON_LOG_CHANNEL_ID, content=("**TOURNEY ECON PAYOUT**\n" + "\n".join(lines))[:1900])
+    return msg is not None
 
 
-async def log_xp(lines: list[str]):
-    await send_channel(XP_LOG_CHANNEL_ID, content=("**TOURNEY XP PAYOUT**\n" + "\n".join(lines))[:1900])
+async def log_xp(lines: list[str]) -> bool:
+    msg = await send_channel(XP_LOG_CHANNEL_ID, content=("**TOURNEY XP PAYOUT QUEUED**\n" + "\n".join(lines))[:1900])
+    return msg is not None
 
 
 def reward_ledger_lines(ledger: list[dict[str, Any]], *, include_place: bool = True) -> list[str]:
@@ -1655,6 +1685,14 @@ def finalize_tournament_db(guild_id: int, tournament: str, actor: int) -> dict[s
                     "details": ["Overall tournament champion"],
                 }
 
+            # Cap cumulative tournament XP per character so multi-event sweeps are exciting but not progression-breaking.
+            for item in by_char.values():
+                raw_xp = int(item.get("xp") or 0)
+                item["xp_uncapped"] = raw_xp
+                if MAX_TOURNEY_XP_PER_CHARACTER and raw_xp > MAX_TOURNEY_XP_PER_CHARACTER:
+                    item["xp"] = MAX_TOURNEY_XP_PER_CHARACTER
+                    item.setdefault("details", []).append(f"XP capped at {MAX_TOURNEY_XP_PER_CHARACTER:,} for tournament balance")
+
             reward_ledger = sorted(by_char.values(), key=lambda x: (-int(x.get("points") or 0), clean(x.get("name"))))
             total_pay = 0
             total_xp = 0
@@ -1714,7 +1752,7 @@ def finalize_tournament_db(guild_id: int, tournament: str, actor: int) -> dict[s
 
             cur.execute("UPDATE tourney.tournaments SET status='completed', updated_at=NOW() WHERE id=%s;", (t["id"],))
             cur.execute("""
-                SELECT e.name AS event_name, e.event_type, c.name AS winner_name, er.character_id
+                SELECT e.id AS event_id, e.name AS event_name, e.event_type, c.name AS winner_name, er.character_id
                   FROM tourney.event_results er
                   JOIN tourney.events e ON e.guild_id=er.guild_id AND e.id=er.event_id
                   JOIN public.characters c ON c.guild_id=er.guild_id AND c.character_id=er.character_id
@@ -1722,6 +1760,26 @@ def finalize_tournament_db(guild_id: int, tournament: str, actor: int) -> dict[s
                  ORDER BY e.id ASC;
             """, (guild_id, t["id"]))
             event_winners = [dict(r) for r in cur.fetchall()]
+
+            # v021: preserve champion history for future Hall of Champions features.
+            cur.execute("""
+                INSERT INTO tourney.champions (guild_id, tournament_id, character_id, champion_type, title)
+                VALUES (%s, %s, %s, 'overall', %s)
+                ON CONFLICT (guild_id, tournament_id, character_id, champion_type) DO NOTHING;
+            """, (guild_id, t["id"], int(champ["character_id"]), f"Overall Champion of {clean(tournament)}"))
+            for ew in event_winners:
+                cur.execute("""
+                    INSERT INTO tourney.event_wins (guild_id, tournament_id, event_id, character_id, event_type, title)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (guild_id, event_id, character_id) DO NOTHING;
+                """, (
+                    guild_id,
+                    t["id"],
+                    int(ew.get("event_id") or 0),
+                    int(ew["character_id"]),
+                    clean(ew.get("event_type")),
+                    f"Winner of {clean(ew.get('event_name'))}",
+                ))
         conn.commit()
     return {
         "ok": True,
@@ -2506,6 +2564,10 @@ async def tourney_finalize(interaction: discord.Interaction, tournament: str):
     emb = tournament_close_announcement_embed(res)
     await announcement_post(emb, ping_role=True)
     ledger = res.get("reward_ledger") or []
+    econ_logs_ok = 0
+    xp_logs_ok = 0
+    econ_logs_expected = 0
+    xp_logs_expected = 0
     for item in ledger:
         name = clean(item.get("name") or "Unknown Character")
         pay = int(item.get("pay") or 0)
@@ -2519,26 +2581,46 @@ async def tourney_finalize(interaction: discord.Interaction, tournament: str):
         details = item.get("details") or []
         detail_text = "; ".join(clean(x) for x in details[:6]) or "Tournament participation"
         if pay:
-            await log_econ([
+            econ_logs_expected += 1
+            if await log_econ([
                 f"Tournament: **{clean(tournament)}**",
                 f"Character: **{name}**",
                 f"Currency awarded: **{fmt_money(pay)}**",
                 f"Prestige/Renown awarded: **+{renown} RP**",
                 f"Events entered: **{events_entered}** | Event wins: **{event_wins}** | Runner-up: **{runner_ups}** | Third: **{third_places}** | Overall Champion: **{'Yes' if overall else 'No'}**",
                 f"Breakdown: {detail_text}",
-            ])
+            ]):
+                econ_logs_ok += 1
         if xp:
-            await log_xp([
+            xp_logs_expected += 1
+            raw_xp = int(item.get("xp_uncapped") or xp)
+            xp_line = f"XP queued: **{xp:,} XP**"
+            if raw_xp != xp:
+                xp_line += f" (uncapped total would have been {raw_xp:,} XP)"
+            if await log_xp([
                 f"Tournament: **{clean(tournament)}**",
                 f"Character: **{name}**",
-                f"XP queued: **{xp:,} XP**",
+                xp_line,
                 f"Prestige/Renown awarded: **+{renown} RP**",
                 f"Events entered: **{events_entered}** | Event wins: **{event_wins}** | Runner-up: **{runner_ups}** | Third: **{third_places}** | Overall Champion: **{'Yes' if overall else 'No'}**",
                 f"Breakdown: {detail_text}",
-            ])
+            ]):
+                xp_logs_ok += 1
+    # v021: add one XP summary after the per-character XP audit entries.
+    if ledger:
+        await log_xp([
+            f"Tournament: **{clean(tournament)}**",
+            f"Total XP queued: **{int(res.get('xp') or 0):,} XP**",
+            f"Total prestige/renown awarded: **+{int(res.get('renown') or 0)} RP**",
+            f"Characters with XP entries: **{xp_logs_ok}/{xp_logs_expected}**",
+            f"Per-character XP cap: **{MAX_TOURNEY_XP_PER_CHARACTER:,} XP**",
+        ])
     if int(res.get("cut") or 0):
         await log_econ([f"Tournament: **{clean(tournament)}**", f"Host treasury cut: **{fmt_money(int(res.get('cut') or 0))}**", f"Based on total tournament payout: **{fmt_money(int(res.get('payout') or 0))}**"])
-    await interaction.followup.send("Tournament finalized. Closing announcement posted, tournament role pinged, and per-character XP/economy logs were posted.", ephemeral=True)
+    log_note = f"Economy logs: {econ_logs_ok}/{econ_logs_expected}. XP logs: {xp_logs_ok}/{xp_logs_expected}."
+    if xp_logs_expected and xp_logs_ok < xp_logs_expected:
+        log_note += " Check TournamentBot access to the XP log channel."
+    await interaction.followup.send(f"Tournament finalized. Closing announcement posted, tournament role pinged, and per-character payout logs were attempted. {log_note}", ephemeral=True)
 
 
 @tree.command(name="tourney-force-close", description="Staff emergency: force-close a stuck tournament without deleting records.", guild=discord.Object(id=GUILD_ID))
