@@ -15,7 +15,7 @@ from discord import app_commands
 import psycopg
 from psycopg.rows import dict_row
 
-APP_VERSION = "Alaris_TournamentBot_v021"
+APP_VERSION = "Alaris_TournamentBot_v022"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] TourneyBot: %(message)s")
 LOG = logging.getLogger("TourneyBot")
@@ -618,65 +618,163 @@ def roll_score(base: int, swing: int = 10) -> int:
     return int(base) + random.randint(1, swing) + random.randint(1, swing)
 
 
+def narrative_trait(cp: dict[str, Any]) -> str:
+    cls = clean(cp.get("class") or "competitor")
+    if cp.get("spell", 0) > cp.get("attack", 0) + 2:
+        return "arcane pressure"
+    if cp.get("defense", 0) + cp.get("sustain", 0) > cp.get("burst", 0) + cp.get("mobility", 0):
+        return "unyielding endurance"
+    if cp.get("precision", 0) >= max(cp.get("burst", 0), cp.get("defense", 0)):
+        return "cold precision"
+    if cp.get("mobility", 0) > cp.get("defense", 0):
+        return "restless speed"
+    if cp.get("control", 0) > cp.get("burst", 0):
+        return "careful control"
+    return f"{cls.lower()} discipline"
+
+
+def performance_tier(score: int, scores: list[int]) -> str:
+    if not scores:
+        return "steady"
+    high = max(scores)
+    low = min(scores)
+    span = max(1, high - low)
+    pct = (score - low) / span
+    if pct >= 0.85:
+        return "dominant"
+    if pct >= 0.62:
+        return "strong"
+    if pct >= 0.38:
+        return "competitive"
+    if pct >= 0.16:
+        return "strained"
+    return "overmatched"
+
+
+def varied_line(event_type: str, c: CharacterRef, cp: dict[str, Any], note: str, score: int, idx: int, total: int) -> str:
+    name = clean(c.name)
+    trait = narrative_trait(cp)
+    cls = clean(cp.get("class") or "competitor")
+    # Intentionally multiple templates per event to prevent four competitors sharing the same phrasing.
+    templates = {
+        "duel": [
+            f"**{name}** opens with {trait}, testing the ring with patient footwork before committing to the exchange.",
+            f"**{name}** lets the first measure breathe, then turns {cls.lower()} training into a sharp bid for center-ring.",
+            f"**{name}** fights for tempo early, pressing the duel through feints, guards, and a sudden change of line.",
+            f"**{name}** absorbs the opening pressure and answers with a controlled sequence that draws the judges forward.",
+        ],
+        "jousting": [
+            f"**{name}** settles deep in the saddle, lance leveled as the destrier thunders down the list.",
+            f"**{name}** times the pass with {trait}, taking the impact squarely instead of yielding the rail.",
+            f"**{name}** drives through the tilt with a dangerous lean, trading safety for a cleaner strike line.",
+            f"**{name}** keeps the shield high through the crash, splinters flashing across the churned ground.",
+        ],
+        "archery": [
+            f"**{name}** studies the range before drawing, the release coming only when the wind finally stills.",
+            f"**{name}** sends a disciplined flight downrange, each shaft correcting the lesson of the last.",
+            f"**{name}** wagers on {trait}, holding the draw a heartbeat longer than comfort allows.",
+            f"**{name}** threads the shot through crowd noise and weather, refusing to hurry the mark.",
+        ],
+        "horse_racing": [
+            f"**{name}** breaks from the line with dirt flying behind the mount's hooves.",
+            f"**{name}** saves strength through the opening stretch, then asks the mount for speed at the dangerous turn.",
+            f"**{name}** rides the rail with {trait}, cutting the course close enough to draw gasps from the crowd.",
+            f"**{name}** lets the pack spend itself early, then surges when the final straight opens.",
+        ],
+        "great_hunt": [
+            f"**{name}** reads the broken trail carefully, finding sign where less patient hunters would see only mud.",
+            f"**{name}** turns {trait} into survival when the quarry doubles back through hostile ground.",
+            f"**{name}** meets the beast at close range, ending the hunt only after a brutal contest of nerve.",
+            f"**{name}** brings back proof of the chase with torn cloak, steady hands, and a story already growing in the telling.",
+        ],
+        "grand_melee": [
+            f"**{name}** disappears into the crush, then reappears at the edge of a collapsing knot of shields.",
+            f"**{name}** survives the first wild surge by reading the field instead of chasing every opening.",
+            f"**{name}** turns {trait} into advantage as the melee breaks into scattered duels and sudden ambushes.",
+            f"**{name}** forces space where there should be none, holding ground while the arena closes around them.",
+            f"**{name}** waits out the reckless charges, then strikes when tired rivals expose their guard.",
+        ],
+    }
+    pool = templates.get(event_type, templates["duel"])
+    return pool[(idx + len(name) + int(score)) % len(pool)]
+
+
 def simulate_event(event_type: str, competitors: list[tuple[CharacterRef, dict[str, Any]]]) -> tuple[list[dict[str, Any]], list[str]]:
     results: list[dict[str, Any]] = []
     lines: list[str] = []
-    label = event_label(event_type)
+    total = len(competitors)
+
+    if event_type == "grand_melee":
+        if total <= 2:
+            lines.append("The melee has narrowed to its final heartbeat; the crowd can follow every step, every feint, every desperate guard.")
+        elif total <= 4:
+            lines.append("The field is no longer chaos. Only a few battered contenders remain, and every movement now feels personal.")
+        elif total <= 8:
+            lines.append("The first storm has passed. Survivors circle through broken formations, watching for the mistake that will end a rival's day.")
+        else:
+            lines.append("The grand melee erupts in full: shields crash, spells flash against the safety wards, and the arena vanishes beneath dust and motion.")
 
     if event_type == "duel":
         for c, cp in competitors:
             base = max(cp["attack"] + cp["defense"], cp["spell"] + cp["control"]) + cp["sustain"] + cp["burst"]
             score = roll_score(base, 8)
-            style = "arcane pressure" if cp["spell"] > cp["attack"] else "martial command"
-            lines.append(f"**{clean(c.name)}** enters the dueling ring with {style}, forcing the match into their preferred rhythm.")
-            results.append({"character": c, "cp": cp, "score": score, "note": style})
+            note = narrative_trait(cp)
+            results.append({"character": c, "cp": cp, "score": score, "note": note})
     elif event_type == "grand_melee":
         for c, cp in competitors:
             chaos = random.randint(2, 20)
-            base = cp["defense"] * 2 + cp["sustain"] * 2 + cp["burst"] + cp["control"] + cp["mobility"]
+            # With fewer competitors left, precision and finishing power matter more than pure chaos.
+            if total <= 3:
+                base = cp["defense"] + cp["sustain"] + cp["burst"] * 2 + cp["mobility"] + cp["control"]
+            else:
+                base = cp["defense"] * 2 + cp["sustain"] * 2 + cp["burst"] + cp["control"] + cp["mobility"]
             score = base + chaos
-            note = "survives the crush" if cp["defense"] + cp["sustain"] >= cp["burst"] else "strikes with sudden violence"
-            lines.append(f"**{clean(c.name)}** {note} as the melee collapses into shields, spellfire, and dust.")
+            note = narrative_trait(cp)
             results.append({"character": c, "cp": cp, "score": score, "note": note})
     elif event_type == "jousting":
         for c, cp in competitors:
             base = cp["riding"] * 3 + cp["attack"] + cp["defense"] + mod(cp["stats"]["str"])
             score = roll_score(base, 9)
-            note = "keeps a brutal seat through impact" if cp["defense"] > cp["mobility"] else "leans into a fast and daring pass"
-            lines.append(f"**{clean(c.name)}** lowers the lance and {note}, drawing a roar from the lists.")
+            note = narrative_trait(cp)
             results.append({"character": c, "cp": cp, "score": score, "note": note})
     elif event_type == "archery":
         for c, cp in competitors:
             base = cp["precision"] * 4 + cp["control"] // 2 + cp["mobility"]
             score = roll_score(base, 8)
-            note = "lands a disciplined cluster near the heart" if cp["precision"] >= cp["control"] else "bends uncanny focus into a nearly impossible shot"
-            lines.append(f"**{clean(c.name)}** takes the line, breathes once, and {note}.")
+            note = narrative_trait(cp)
             results.append({"character": c, "cp": cp, "score": score, "note": note})
     elif event_type == "horse_racing":
         for c, cp in competitors:
             base = cp["riding"] * 3 + cp["mobility"] * 2 + cp["sustain"] + mod(cp["stats"]["con"])
             score = roll_score(base, 10)
-            note = "paces the mount with veteran patience" if cp["sustain"] > cp["mobility"] else "breaks hard through the dangerous turn"
-            lines.append(f"**{clean(c.name)}** {note}, thunder rolling beneath the hooves.")
+            note = narrative_trait(cp)
             results.append({"character": c, "cp": cp, "score": score, "note": note})
     else:  # great_hunt
-        beasts = ["a barbed marsh-stalker", "an iron-tusk boar", "a glass-eyed wyvernling", "a moon-mad dire hart", "a cliffside ashmaw"]
+        beasts = ["a barbed marsh-stalker", "an iron-tusk boar", "a glass-eyed wyvernling", "a moon-mad dire hart", "a cliffside ashmaw", "a bramble-crowned manticore", "a frostbitten cave lion"]
         beast = random.choice(beasts)
+        lines.append(f"The hunt-master releases the marks: today's quarry is **{beast}**, and the field scatters into dangerous ground.")
         for c, cp in competitors:
             base = cp["survival"] * 3 + max(cp["attack"], cp["spell"]) + cp["sustain"] + cp["precision"]
             score = roll_score(base, 12)
-            note = "tracks patiently and ends the chase cleanly" if cp["survival"] >= cp["burst"] else "turns a dangerous ambush into a spectacular kill"
-            lines.append(f"**{clean(c.name)}** draws {beast} and {note}.")
+            note = narrative_trait(cp)
             results.append({"character": c, "cp": cp, "score": score, "note": note})
 
-    # Renown is a tie-breaker/seed flavor only, not a direct score bonus.
     results.sort(key=lambda r: (-r["score"], -int(r["cp"].get("renown") or 0), clean(r["character"].name)))
+    scores = [int(r["score"]) for r in results]
     for i, r in enumerate(results, start=1):
         r["place"] = i
+        tier = performance_tier(int(r["score"]), scores)
+        r["performance_tier"] = tier
+        if i <= min(6, len(results)):
+            lines.append(varied_line(event_type, r["character"], r["cp"], str(r.get("note") or ""), int(r["score"]), i, total))
+
     if results:
         champ = results[0]["character"]
         if event_type == "grand_melee":
-            lines.append(f"When the safe wards flare and the field is called, **{clean(champ.name)}** is the last competitor standing.")
+            if total <= 3:
+                lines.append(f"The final exchange breaks the last circle of resistance. When the wards flare, **{clean(champ.name)}** alone remains standing in the scarred dust.")
+            else:
+                lines.append(f"When the safe wards flare and the field is called, **{clean(champ.name)}** is the last competitor standing.")
         elif event_type == "duel":
             lines.append(f"The final exchange ends with **{clean(champ.name)}** holding center-ring as the judges call the duel.")
         elif event_type == "jousting":
@@ -2675,6 +2773,55 @@ async def tourney_admin_reset(interaction: discord.Interaction, tournament: str,
     if "events_changed" in res:
         summary_bits.append(f"Events changed: **{int(res.get('events_changed') or 0)}**")
     await interaction.followup.send("\n".join(summary_bits), ephemeral=True)
+
+
+def wipe_tourney_testing_data_db(guild_id: int, confirm_phrase: str) -> dict[str, Any]:
+    """Hard wipe tournament namespace data for test cleanup only.
+
+    This intentionally does not reverse already-paid XP or economy rewards.
+    It only clears TournamentBot-owned tables so test tournaments can be removed.
+    """
+    if str(confirm_phrase or "").strip() != "WIPE TOURNEY TEST DATA":
+        return {"ok": False, "reason": "bad_confirmation"}
+    counts: dict[str, int] = {}
+    tables = [
+        "tourney.awards",
+        "tourney.event_wins",
+        "tourney.champions",
+        "tourney.event_results",
+        "tourney.event_matches",
+        "tourney.entries",
+        "tourney.events",
+        "tourney.tournaments",
+        "tourney.records",
+        "tourney.competitor_profiles",
+    ]
+    with db() as conn:
+        with conn.cursor() as cur:
+            for table in tables:
+                try:
+                    cur.execute(f"DELETE FROM {table} WHERE guild_id=%s;", (guild_id,))
+                    counts[table] = int(cur.rowcount or 0)
+                except Exception as exc:
+                    counts[table] = -1
+            conn.commit()
+    return {"ok": True, "counts": counts}
+
+
+@tree.command(name="tourney-test-wipe", description="STAFF DANGER: wipe TournamentBot test data for this server only.", guild=discord.Object(id=GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
+@staff_only()
+async def tourney_test_wipe(interaction: discord.Interaction, confirm_phrase: str):
+    await interaction.response.defer(ephemeral=True)
+    res = await run_db(wipe_tourney_testing_data_db, int(interaction.guild_id or GUILD_ID), confirm_phrase)
+    if not res.get("ok"):
+        await interaction.followup.send("Wipe cancelled. Confirmation phrase must be exactly `WIPE TOURNEY TEST DATA`.", ephemeral=True)
+        return
+    counts = res.get("counts") or {}
+    lines = ["TournamentBot test data wiped for this guild.", "", "This did **not** reverse XP or economy payouts already issued."]
+    for table, count in counts.items():
+        lines.append(f"• `{table}`: {count}")
+    await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
 
 @tree.error
 async def on_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
