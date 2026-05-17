@@ -1960,7 +1960,7 @@ class TournamentOpenView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Open Tournament", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Open Tournament", style=discord.ButtonStyle.success, row=1)
     async def open_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self.selected_events:
             await interaction.response.send_message("Select at least one event before opening the tournament.", ephemeral=True)
@@ -1985,14 +1985,24 @@ class TournamentOpenView(discord.ui.View):
 
 class TournamentEventMultiSelect(discord.ui.Select):
     def __init__(self, options: list[discord.SelectOption]):
-        super().__init__(placeholder="Select enabled events", min_values=1, max_values=len(options), options=options)
+        super().__init__(placeholder="Select enabled events", min_values=1, max_values=len(options), options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction):
         view = self.view
         if isinstance(view, TournamentOpenView):
             view.selected_events = list(self.values)
             labels = [event_label(v) for v in self.values]
-            await interaction.response.send_message("Selected events: " + ", ".join(labels), ephemeral=True)
+            embed = discord.Embed(
+                title="Open Tournament Setup",
+                color=discord.Color.gold(),
+                description=(
+                    f"Tournament: **{clean(view.name)}**\n"
+                    f"Host: **{clean(view.host_kingdom)}**\n\n"
+                    "Selected events:\n" + "\n".join(f"• **{label}**" for label in labels) +
+                    "\n\nNow click **Open Tournament** below the dropdown."
+                ),
+            )
+            await interaction.response.edit_message(embed=embed, view=view)
 
 
 @tree.command(name="tourney-open", description="Staff: open a tournament with selected events and post the public announcement.", guild=discord.Object(id=GUILD_ID))
