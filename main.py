@@ -15,7 +15,8 @@ from discord import app_commands
 import psycopg
 from psycopg.rows import dict_row
 
-APP_VERSION = "Alaris_TournamentBot_v022"
+APP_VERSION = "Alaris_TournamentBot_v023"
+DEVELOPER_ROLE_ID = 1505626082701738165
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] TourneyBot: %(message)s")
 LOG = logging.getLogger("TourneyBot")
@@ -854,6 +855,26 @@ def staff_only():
             await interaction.followup.send("You do not have permission to use this tournament staff command.", ephemeral=True)
         else:
             await interaction.response.send_message("You do not have permission to use this tournament staff command.", ephemeral=True)
+        return False
+    return app_commands.check(pred)
+
+
+def is_developer(interaction: discord.Interaction) -> bool:
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    if interaction.user.guild_permissions.administrator:
+        return True
+    return any(role.id == DEVELOPER_ROLE_ID for role in interaction.user.roles)
+
+
+def developer_only():
+    async def pred(interaction: discord.Interaction) -> bool:
+        if is_developer(interaction):
+            return True
+        if interaction.response.is_done():
+            await interaction.followup.send("This command is restricted to the Alaris developer role.", ephemeral=True)
+        else:
+            await interaction.response.send_message("This command is restricted to the Alaris developer role.", ephemeral=True)
         return False
     return app_commands.check(pred)
 
@@ -2175,7 +2196,8 @@ async def tourney_open(interaction: discord.Interaction, name: str, host_kingdom
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@tree.command(name="tourney-create", description="Staff: create a tournament.", guild=discord.Object(id=GUILD_ID))
+# Removed from slash sync in v023: /tourney-create is replaced by /tourney-open.
+# @tree.command(name="tourney-create", description="retired")
 @app_commands.default_permissions(manage_guild=True)
 @staff_only()
 @app_commands.choices(host_kingdom=KINGDOM_CHOICES)
@@ -2808,9 +2830,9 @@ def wipe_tourney_testing_data_db(guild_id: int, confirm_phrase: str) -> dict[str
     return {"ok": True, "counts": counts}
 
 
-@tree.command(name="tourney-test-wipe", description="STAFF DANGER: wipe TournamentBot test data for this server only.", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="tourney-test-wipe", description="DEV DANGER: wipe TournamentBot test data for this server only.", guild=discord.Object(id=GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
-@staff_only()
+@developer_only()
 async def tourney_test_wipe(interaction: discord.Interaction, confirm_phrase: str):
     await interaction.response.defer(ephemeral=True)
     res = await run_db(wipe_tourney_testing_data_db, int(interaction.guild_id or GUILD_ID), confirm_phrase)
